@@ -21,12 +21,20 @@
 
 #define XLOG_CONVEYOR_INSERT_PAYLOAD_PAGE			0x10
 #define	XLOG_CONVEYOR_ALLOCATE_PAYLOAD_SEGMENT		0x20
+#define	XLOG_CONVEYOR_ALLOCATE_INDEX_SEGMENT		0x30
 
 typedef struct xl_cb_allocate_payload_segment
 {
-	CBSegNo	segno;
-	bool	is_extend;
+	CBSegNo		segno;
+	bool		is_extend;
 } xl_cb_allocate_payload_segment;
+
+typedef struct xl_cb_allocate_index_segment
+{
+	CBSegNo		segno;
+	CBPageNo	pageno;
+	bool		is_extend;
+} xl_cb_allocate_index_segment;
 
 extern void conveyor_desc(StringInfo buf, XLogReaderState *record);
 extern void conveyor_redo(XLogReaderState *record);

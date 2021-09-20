@@ -3771,3 +3771,5 @@ CBMetapageData
 CBPageNo
 CBSegNo
 ConveyorBelt
+xl_cb_allocate_index_segment
+xl_cb_allocate_payload_segment

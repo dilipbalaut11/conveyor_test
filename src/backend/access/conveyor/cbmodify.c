@@ -145,6 +145,10 @@ cb_insert_payload_page(RelFileNode *rnode, ForkNumber fork, Buffer metabuffer,
  * InvalidBuffer. Otherwise, 'fsmblock' should be the block number of the
  * relevant freespace map block and 'fsmbuffer' the corresponding buffer.
  *
+ * 'is_extend' should be true when we're allocating a segment that hasn't
+ * existed before, necessitating an adjustment to the metapage's
+ * next-segment counter.
+ *
  * See cb_xlog_allocate_payload_segment for the corresponding REDO routine.
  */
 void
@@ -192,13 +196,14 @@ cb_allocate_payload_segment(RelFileNode *rnode,
 						  REGBUF_STANDARD);
 		if (fsmblock != InvalidBlockNumber)
 			XLogRegisterBlock(1, rnode, fork, fsmblock,
-							  BufferGetPage(fsmbuffer),
-							  REGBUF_STANDARD);
+							  BufferGetPage(fsmbuffer), REGBUF_STANDARD);
 		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
 		lsn = XLogInsert(RM_CONVEYOR_ID,
 						 XLOG_CONVEYOR_ALLOCATE_PAYLOAD_SEGMENT);
 
 		PageSetLSN(metapage, lsn);
+		if (fsmblock != InvalidBlockNumber)
+			PageSetLSN(BufferGetPage(fsmbuffer), lsn);
 	}
 
 	END_CRIT_SECTION();
@@ -224,6 +229,12 @@ cb_allocate_payload_segment(RelFileNode *rnode,
  *
  * 'segno' is the segment number of the new index segment, and 'pageno'
  * is the first logical page for which it will store index information.
+ *
+ * 'is_extend' should be true when we're allocating a segment that hasn't
+ * existed before, necessitating an adjustment to the metapage's
+ * next-segment counter.
+ *
+ * See cb_xlog_allocate_index_segment for the corresponding REDO routine.
  */
 void
 cb_allocate_index_segment(RelFileNode *rnode,
@@ -237,6 +248,7 @@ cb_allocate_index_segment(RelFileNode *rnode,
 						  Buffer fsmbuffer,
 						  CBSegNo segno,
 						  CBPageNo pageno,
+						  bool is_extend,
 						  bool needs_xlog)
 {
 	Page		metapage;
@@ -252,6 +264,9 @@ cb_allocate_index_segment(RelFileNode *rnode,
 
 	cb_metapage_add_index_segment(meta, segno);
 	MarkBufferDirty(metabuffer);
+
+	if (is_extend)
+		cb_metapage_increment_next_segment(meta, segno);
 
 	cb_indexpage_initialize(indexpage, pageno, true);
 	MarkBufferDirty(indexbuffer);
@@ -272,7 +287,34 @@ cb_allocate_index_segment(RelFileNode *rnode,
 
 	if (needs_xlog)
 	{
-		/* XXX write xlog, set LSNs */
+		xl_cb_allocate_index_segment	xlrec;
+		XLogRecPtr	lsn;
+
+		xlrec.segno = segno;
+		xlrec.pageno = pageno;
+		xlrec.is_extend = is_extend;
+
+		XLogBeginInsert();
+		XLogRegisterBlock(0, rnode, fork, CONVEYOR_METAPAGE, metapage,
+						  REGBUF_STANDARD);
+		XLogRegisterBlock(1, rnode, fork, indexblock, indexpage,
+						  REGBUF_STANDARD | REGBUF_WILL_INIT);
+		if (prevblock != InvalidBlockNumber)
+			XLogRegisterBlock(2, rnode, fork, prevblock,
+							  BufferGetPage(prevbuffer), REGBUF_STANDARD);
+		if (fsmblock != InvalidBlockNumber)
+			XLogRegisterBlock(3, rnode, fork, fsmblock,
+							  BufferGetPage(fsmbuffer), REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec, sizeof(xlrec));
+		lsn = XLogInsert(RM_CONVEYOR_ID,
+						 XLOG_CONVEYOR_ALLOCATE_INDEX_SEGMENT);
+
+		PageSetLSN(metapage, lsn);
+		PageSetLSN(indexpage, lsn);
+		if (prevblock != InvalidBlockNumber)
+			PageSetLSN(BufferGetPage(prevbuffer), lsn);
+		if (fsmblock != InvalidBlockNumber)
+			PageSetLSN(BufferGetPage(fsmbuffer), lsn);
 	}
 
 	END_CRIT_SECTION();

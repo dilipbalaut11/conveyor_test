@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/cbfsmpage.h"
+#include "access/cbindexpage.h"
 #include "access/cbmetapage.h"
 #include "access/cbxlog.h"
 #include "access/xloginsert.h"
@@ -102,6 +103,80 @@ cb_xlog_allocate_payload_segment(XLogReaderState *record)
 }
 
 /*
+ * REDO function for cb_allocate_index_segment.
+ */
+static void
+cb_xlog_allocate_index_segment(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_cb_allocate_index_segment *xlrec;
+	bool		have_prev_page;
+	bool		have_fsm_page;
+	Buffer		metabuffer;
+	Buffer		indexbuffer;
+	Buffer		prevbuffer = InvalidBuffer;
+	Buffer		fsmbuffer = InvalidBuffer;
+
+	have_prev_page = XLogRecGetBlockTag(record, 2, NULL, NULL, NULL);
+	have_fsm_page = XLogRecGetBlockTag(record, 3, NULL, NULL, NULL);
+
+	xlrec = (xl_cb_allocate_index_segment *) XLogRecGetData(record);
+
+	if (XLogReadBufferForRedo(record, 0, &metabuffer) == BLK_NEEDS_REDO)
+	{
+		Page	metapage = BufferGetPage(metabuffer);
+		CBMetapageData *meta;
+
+		meta = cb_metapage_get_special(metapage);
+		cb_metapage_add_index_segment(meta, xlrec->segno);
+		if (xlrec->is_extend)
+			cb_metapage_increment_next_segment(meta, xlrec->segno);
+		if (!have_fsm_page)
+			cb_metapage_set_fsm_bit(meta, xlrec->segno, true);
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
+
+	if (XLogReadBufferForRedo(record, 1, &indexbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	indexpage = BufferGetPage(indexbuffer);
+
+		cb_indexpage_initialize(indexpage, xlrec->pageno, true);
+		PageSetLSN(indexpage, lsn);
+		MarkBufferDirty(indexbuffer);
+	}
+
+	if (have_prev_page &&
+		XLogReadBufferForRedo(record, 2, &prevbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	prevpage = BufferGetPage(prevbuffer);
+
+		cb_indexpage_set_next_segment(prevpage, xlrec->segno);
+		PageSetLSN(prevpage, lsn);
+		MarkBufferDirty(prevbuffer);
+	}
+
+	if (have_fsm_page &&
+		XLogReadBufferForRedo(record, 3, &fsmbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	fsmpage = BufferGetPage(fsmbuffer);
+
+		cb_fsmpage_set_fsm_bit(fsmpage, xlrec->segno, true);
+		PageSetLSN(fsmpage, lsn);
+		MarkBufferDirty(fsmbuffer);
+	}
+
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
+	if (BufferIsValid(indexbuffer))
+		UnlockReleaseBuffer(indexbuffer);
+	if (BufferIsValid(prevbuffer))
+		UnlockReleaseBuffer(prevbuffer);
+	if (BufferIsValid(fsmbuffer))
+		UnlockReleaseBuffer(fsmbuffer);
+}
+
+/*
  * Main entrypoint for conveyor belt REDO.
  */
 void
@@ -116,6 +191,9 @@ conveyor_redo(XLogReaderState *record)
 			break;
 		case XLOG_CONVEYOR_ALLOCATE_PAYLOAD_SEGMENT:
 			cb_xlog_allocate_payload_segment(record);
+			break;
+		case XLOG_CONVEYOR_ALLOCATE_INDEX_SEGMENT:
+			cb_xlog_allocate_index_segment(record);
 			break;
 		default:
 			elog(PANIC, "conveyor_redo: unknown op code %u", info);

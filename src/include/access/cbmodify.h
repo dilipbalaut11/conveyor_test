@@ -59,7 +59,7 @@ extern void cb_allocate_payload_segment(RelFileNode *rnode,
 extern void cb_allocate_index_segment(RelFileNode *rnode,
 									  ForkNumber fork,
 									  Buffer metabuffer,
-						  			  BlockNumber indexblock,
+									  BlockNumber indexblock,
 									  Buffer indexbuffer,
 									  BlockNumber prevblock,
 									  Buffer prevbuffer,
@@ -67,6 +67,7 @@ extern void cb_allocate_index_segment(RelFileNode *rnode,
 									  Buffer fsmbuffer,
 									  CBSegNo segno,
 									  CBPageNo pageno,
+									  bool is_extend,
 									  bool needs_xlog);
 
 #endif							/* CBMODIFY_H */
