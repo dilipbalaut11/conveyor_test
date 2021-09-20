@@ -254,7 +254,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		 * only true if we've verified that the size of the relation on disk
 		 * is large enough.
 		 */
-		can_allocate_segment = (free_segno != CB_INVALID_SEGMENT)
+		can_allocate_segment = (mode == BUFFER_LOCK_EXCLUSIVE)
+			&& (free_segno != CB_INVALID_SEGMENT)
 			&& (free_segno < next_segno ||
 				free_segno < possibly_not_on_disk_segno);
 
