@@ -12,13 +12,12 @@ data that needs to be stored at any given time.
 
 Some other parts of PostgreSQL, for example xlog.c and slru.c, handle
 similar needs by using a series of files at the operating system level,
-adding new ones at the end and removing old ones. Here, we want a system
-that can be used within a standard relation fork, and so instead maintain a
-logical-to-physical page mapping. Callers allocate new logical page numbers
-(which are just consecutive 64-bit integers) and this module takes care of
-figuring out where to place them phyically. When the oldest logical pages
-are thrown away, the blocks allocated to them can be reused for new
-logical pages.
+adding new ones at the end and removing old ones. We want to use a standard
+relation fork, and so instead maintain a logical-to-physical page mapping.
+Callers allocate new logical page numbers (which are just consecutive 64-bit
+integers) and this module takes care of figuring out where to place them
+phyically. When the oldest logical pages are thrown away, the blocks
+allocated to them can be reused for new logical pages.
 
 Conceptually, a relation fork organized as a conveyor belt has three parts:
 
