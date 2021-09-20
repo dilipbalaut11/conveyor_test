@@ -157,6 +157,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	BlockNumber fsmblock;
 	Buffer		metabuffer;
 	Buffer		fsmbuffer = InvalidBuffer;
+	Buffer		buffer;
+	CBPageNo	next_pageno;
 	CBSegNo		free_segno = CB_INVALID_SEGMENT;
 	CBSegNo		possibly_not_on_disk_segno = 0;
 	bool		needs_xlog;
@@ -211,8 +213,6 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		CBMetapageData *meta;
 		CBMInsertState insert_state;
 		BlockNumber next_blkno;
-		Buffer		buffer;
-		CBPageNo	next_pageno;
 		CBSegNo		next_segno;
 		bool		can_allocate_segment;
 
@@ -324,21 +324,15 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			{
 				/*
 				 * Remember things that we'll need to know when the caller
-				 * invokes ConveyorBeltPerformInsert.
+				 * invokes ConveyorBeltPerformInsert and
+				 * ConveyorBeltCleanupInsert.
 				 */
 				cb->cb_insert_block = next_blkno;
 				cb->cb_insert_buffer = buffer;
 				cb->cb_insert_metabuffer = metabuffer;
 
-				/*
-				 * Relock the metapage. Caller should immediately start a
-				 * critical section and populate the buffer.
-				 */
-				LockBuffer(metabuffer, BUFFER_LOCK_EXCLUSIVE);
-
-				/* All done. */
-				*pageno = next_pageno;
-				return buffer;
+				/* Success, so escape toplevel retry loop. */
+				break;
 			}
 		}
 		else
@@ -444,16 +438,25 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		{
 			elog(ERROR, "XXX creating index segments is not implemented yet");
 		}
+
+		/*
+		 * Prepare for next attempt by reacquiring all relevant buffer locks,
+		 * except for the one on the metapage, which is acquired at the top of
+		 * the loop.
+		 */
+		if (BufferIsValid(fsmbuffer))
+			LockBuffer(fsmbuffer, BUFFER_LOCK_EXCLUSIVE);
 	}
 
 	/*
-	 * Prepare for next attempt by reacquiring all relevant buffer locks,
-	 * except for the one on the metapage, which is acquired at the top of
-	 * the loop.
+	 * Relock the metapage. Caller should immediately start a critical section
+	 * and populate the buffer.
 	 */
-	if (BufferIsValid(fsmbuffer))
-		LockBuffer(fsmbuffer, BUFFER_LOCK_EXCLUSIVE);
-	return InvalidBuffer;
+	LockBuffer(metabuffer, BUFFER_LOCK_EXCLUSIVE);
+
+	/* All done. */
+	*pageno = next_pageno;
+	return buffer;
 }
 
 /*
@@ -498,8 +501,8 @@ ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer, bool page_std)
 						   needs_xlog, page_std);
 
 	/*
-	 * Buffer locks will be released by ConveyorBeltCleanupInsert, but we
-	 * can invalidate some other fields now.
+	 * Buffer locks will be released by ConveyorBeltCleanupInsert, but we can
+	 * invalidate some other fields now.
 	 */
 	cb->cb_insert_relfilenode = NULL;
 	cb->cb_insert_block = InvalidBlockNumber;
