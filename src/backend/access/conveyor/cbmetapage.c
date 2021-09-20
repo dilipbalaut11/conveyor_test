@@ -45,10 +45,10 @@ cb_metapage_initialize(Page page, uint16 pages_per_segment)
 	meta->cbm_pages_per_segment = pages_per_segment;
 
 	/*
-	 * PageInit has already zeroed the page, so we only need to initialize
-	 * any fields that need to be non-zero. Everything of type CBPageNo
-	 * and all of the freespace map should start out as 0, but most of the
-	 * fields of CBSegNo fields need to be set to CB_INVALID_SEGMENT.
+	 * PageInit has already zeroed the page, so we only need to initialize any
+	 * fields that need to be non-zero. Everything of type CBPageNo and all of
+	 * the freespace map should start out as 0, but most of the fields of
+	 * CBSegNo fields need to be set to CB_INVALID_SEGMENT.
 	 */
 	meta->cbm_oldest_index_segment = CB_INVALID_SEGMENT;
 	meta->cbm_newest_index_segment = CB_INVALID_SEGMENT;
@@ -133,7 +133,11 @@ cb_metapage_find_logical_page(CBMetapageData *meta,
  *
  * Regardless of the return value, *next_pageno and *next_segno will be
  * set to the lowest-numbered logical page that is not allocated and the
- * lowest segment number that is not allocated, respectively.
+ * lowest segment number that is not allocated, respectively. In addition,
+ * *index_metapage_start will be set to the first logical page number
+ * covered by the metapage portion of the index, and *newest_index_segment
+ * will be set to the segment number of the newest index segment, or
+ * CB_INVALID_SEGMENT if there is none.
  *
  * If the return value is CBM_INSERT_OK, there is an unfilled payload segment,
  * and *blkno will be set to the block number of the first unused page in that
@@ -143,7 +147,9 @@ CBMInsertState
 cb_metapage_get_insert_state(CBMetapageData *meta,
 							 BlockNumber *blkno,
 							 CBPageNo *next_pageno,
-							 CBSegNo *next_segno)
+							 CBSegNo *next_segno,
+							 CBPageNo *index_metapage_start,
+							 CBSegNo *newest_index_segment)
 {
 	CBPageNo	relp;
 	CBSegNo		segno;
@@ -152,27 +158,29 @@ cb_metapage_get_insert_state(CBMetapageData *meta,
 	/* Set the values that we return unconditionally. */
 	*next_pageno = meta->cbm_next_logical_page;
 	*next_segno = meta->cbm_next_segment;
+	*index_metapage_start = meta->cbm_index_metapage_start;
+	*newest_index_segment = meta->cbm_newest_index_segment;
 
 	/* Compute next logical page number relative to start of metapage. */
 	relp = meta->cbm_next_logical_page - meta->cbm_index_metapage_start;
 
 	/*
-	 * If the next logical page number doesn't fit on the metapage, we need
-	 * to make space by relocating some index entries to an index segment.
+	 * If the next logical page number doesn't fit on the metapage, we need to
+	 * make space by relocating some index entries to an index segment.
 	 *
 	 * Potentially, we could instead clean out some index entries from the
-	 * metapage that now precede the logical truncation point, but that
-	 * would require a cleanup lock on the metapage, and it normally isn't
-	 * going to be possible, because typically the last truncate operation
-	 * will have afterward done any such work that is possible. We might miss
-	 * an opportunity in the case where the last truncate operation didn't
-	 * clean up fully, but hopefully that's rare enough that we don't need
-	 * to stress about it.
+	 * metapage that now precede the logical truncation point, but that would
+	 * require a cleanup lock on the metapage, and it normally isn't going to
+	 * be possible, because typically the last truncate operation will have
+	 * afterward done any such work that is possible. We might miss an
+	 * opportunity in the case where the last truncate operation didn't clean
+	 * up fully, but hopefully that's rare enough that we don't need to stress
+	 * about it.
 	 *
 	 * If the newest index segment is already full, then a new index segment
-	 * will need to be created. Otherwise, some entries can be copied into
-	 * the existing index segment. To make things easier for the caller, there
-	 * is a metapage flag to tell us which situation prevails.
+	 * will need to be created. Otherwise, some entries can be copied into the
+	 * existing index segment. To make things easier for the caller, there is
+	 * a metapage flag to tell us which situation prevails.
 	 */
 	if (relp >= CB_METAPAGE_INDEX_ENTRIES * meta->cbm_pages_per_segment)
 	{
@@ -214,7 +222,8 @@ cb_metapage_advance_next_logical_page(CBMetapageData *meta,
 
 	/* Perform sanity checks. */
 	if (cb_metapage_get_insert_state(meta, &expected_blkno, &dummy_pageno,
-									 &dummy_segno) != CBM_INSERT_OK)
+									 &dummy_segno, &dummy_pageno, &dummy_segno)
+		!= CBM_INSERT_OK)
 		elog(ERROR, "no active insertion segment");
 	if (blkno != expected_blkno)
 		elog(ERROR, "new page is at block %u but expected block %u",
@@ -453,7 +462,7 @@ cb_metapage_find_free_segment(CBMetapageData *meta)
 
 	for (i = 0; i < CB_METAPAGE_FREESPACE_BYTES; i += sizeof(uint64))
 	{
-		uint64	word = * (uint64 *) &meta->cbm_freespace_map[i];
+		uint64		word = *(uint64 *) &meta->cbm_freespace_map[i];
 
 		if (word != PG_UINT64_MAX)
 		{

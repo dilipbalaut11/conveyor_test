@@ -154,8 +154,12 @@ ConveyorBeltOpen(Relation rel, ForkNumber fork, MemoryContext mcxt)
 Buffer
 ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 {
-	BlockNumber fsmblock;
+	BlockNumber indexblock = InvalidBlockNumber;
+	BlockNumber prevblock = InvalidBlockNumber;
+	BlockNumber fsmblock = InvalidBlockNumber;
 	Buffer		metabuffer;
+	Buffer		indexbuffer = InvalidBuffer;
+	Buffer		prevbuffer = InvalidBuffer;
 	Buffer		fsmbuffer = InvalidBuffer;
 	Buffer		buffer;
 	CBPageNo	next_pageno;
@@ -213,6 +217,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		CBMetapageData *meta;
 		CBMInsertState insert_state;
 		BlockNumber next_blkno;
+		CBPageNo	index_metapage_start;
+		CBSegNo		newest_index_segment;
 		CBSegNo		next_segno;
 		bool		can_allocate_segment;
 
@@ -228,14 +234,16 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		 * lock on the metapage.
 		 *
 		 * NB: Our rule is that the lock on the metapage is acquired last,
-		 * after all other buffer locks. If any of fsmbuffer, idxbuffer, and
-		 * newidxbuffer are valid, they are also exclusively locked at this
+		 * after all other buffer locks. If any of indexbuffer, prevbuffer,
+		 * and fsmbuffer are valid, they are also exclusively locked at this
 		 * point.
 		 */
 		LockBuffer(metabuffer, mode);
 		meta = cb_metapage_get_special(BufferGetPage(metabuffer));
 		insert_state = cb_metapage_get_insert_state(meta, &next_blkno,
-													&next_pageno, &next_segno);
+													&next_pageno, &next_segno,
+													&index_metapage_start,
+													&newest_index_segment);
 
 		/*
 		 * If we need to allocate a payload or index segment, and we don't
@@ -248,52 +256,91 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			free_segno = cb_metapage_find_free_segment(meta);
 
 		/*
-		 * We cannot allocate a segment unless at least the first page of that
-		 * segment is guaranteed to be on disk. This is certain to be true for
-		 * any segment that's been allocated previously, but otherwise it's
-		 * only true if we've verified that the size of the relation on disk
-		 * is large enough.
+		 * If we need a new payload or index segment, see whether it's
+		 * possible to complete that operation on this trip through the loop.
+		 *
+		 * This will only be possible if we've got an exclusive lock on the
+		 * metapage.
+		 *
+		 * Furthermore, by rule, we cannot allocate a segment unless at least
+		 * the first page of that segment is guaranteed to be on disk. This is
+		 * certain to be true for any segment that's been allocated
+		 * previously, but otherwise it's only true if we've verified that the
+		 * size of the relation on disk is large enough.
 		 */
-		can_allocate_segment = (mode == BUFFER_LOCK_EXCLUSIVE)
-			&& (free_segno != CB_INVALID_SEGMENT)
-			&& (free_segno < next_segno ||
-				free_segno < possibly_not_on_disk_segno);
+		can_allocate_segment =
+			(insert_state != CBM_INSERT_NEEDS_PAYLOAD_SEGMENT
+			 || insert_state != CBM_INSERT_NEEDS_INDEX_SEGMENT) &&
+			mode == BUFFER_LOCK_EXCLUSIVE &&
+			(free_segno != CB_INVALID_SEGMENT) &&
+			(free_segno < next_segno ||
+			 free_segno < possibly_not_on_disk_segno);
 
 		/*
-		 * If the metapage says that we need a payload segment, and on a
-		 * previous trip through this loop we identified a candidate segment,
-		 * then see if we can allocate it.
+		 * If it still looks like we can allocate, check for the case where we
+		 * need a new index segment but don't have the other required buffer
+		 * locks.
 		 */
-		if (insert_state == CBM_INSERT_NEEDS_PAYLOAD_SEGMENT &&
-			can_allocate_segment)
+		if (can_allocate_segment &&
+			insert_state != CBM_INSERT_NEEDS_INDEX_SEGMENT &&
+			!BufferIsValid(indexbuffer) &&
+			!BufferIsValid(prevbuffer))
+			can_allocate_segment = false;
+
+		/*
+		 * If it still looks like we can allocate, check for the case where
+		 * the segment we planned to allocate is no longer free.
+		 */
+		if (can_allocate_segment)
 		{
-			bool		segment_still_free;
-
-			Assert(mode == BUFFER_LOCK_EXCLUSIVE);
-
 			/* fsmbuffer, if valid, is already exclusively locked. */
 			if (BufferIsValid(fsmbuffer))
-				segment_still_free =
-					cb_fsmpage_get_fsm_bit(BufferGetPage(fsmbuffer),
-										   free_segno);
+				can_allocate_segment =
+					!cb_fsmpage_get_fsm_bit(BufferGetPage(fsmbuffer),
+											free_segno);
 			else
-				segment_still_free = cb_metapage_get_fsm_bit(meta, free_segno);
+				can_allocate_segment =
+					!cb_metapage_get_fsm_bit(meta, free_segno);
+		}
 
-			/*
-			 * If the target segment is still free, we can go ahead and
-			 * allocate it now. After that, we know there is a non-full
-			 * payload segment and can plan to try to grab the first page.
-			 */
-			if (segment_still_free)
+		/* If it STILL looks like we can allocate, do it! */
+		if (can_allocate_segment)
+		{
+			if (insert_state == CBM_INSERT_NEEDS_PAYLOAD_SEGMENT)
 			{
 				cb_allocate_payload_segment(cb->cb_insert_relfilenode,
 											cb->cb_fork, metabuffer,
 											fsmblock, fsmbuffer, free_segno,
 											free_segno >= next_segno,
 											needs_xlog);
+
+				/*
+				 * We know for sure that there's now a payload segment that
+				 * isn't full - and we know exactly where it's located.
+				 */
 				insert_state = CBM_INSERT_OK;
 				next_blkno = cb_segment_to_block(cb->cb_pages_per_segment,
 												 free_segno, 0);
+			}
+			else
+			{
+				Assert(insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT);
+
+				cb_allocate_index_segment(cb->cb_insert_relfilenode,
+										  cb->cb_fork, metabuffer,
+										  indexblock, indexbuffer,
+										  prevblock, prevbuffer,
+										  fsmblock, fsmbuffer, free_segno,
+										  index_metapage_start,
+										  free_segno >= next_segno,
+										  needs_xlog);
+
+				/*
+				 * We know for sure that there's now an index segment that
+				 * isn't full, and our next move must be to relocate some
+				 * index entries to that index segment.
+				 */
+				insert_state = CBM_INSERT_NEEDS_INDEX_ENTRIES_RELOCATED;
 			}
 
 			/*
@@ -305,6 +352,18 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 
 		/* Release buffer locks and, except for the metapage, also pins. */
 		LockBuffer(metabuffer, BUFFER_LOCK_UNLOCK);
+		if (BufferIsValid(indexbuffer))
+		{
+			UnlockReleaseBuffer(indexbuffer);
+			indexblock = InvalidBlockNumber;
+			indexbuffer = InvalidBuffer;
+		}
+		if (BufferIsValid(prevbuffer))
+		{
+			UnlockReleaseBuffer(prevbuffer);
+			prevblock = InvalidBlockNumber;
+			prevbuffer = InvalidBuffer;
+		}
 		if (BufferIsValid(fsmbuffer))
 		{
 			UnlockReleaseBuffer(fsmbuffer);
@@ -356,7 +415,26 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			elog(ERROR, "XXX relocating index entries is not implemented yet");
 		}
 
-		/* Do we need a new segment? */
+		/*
+		 * If we need to add a new index segment, we'll have to update the
+		 * newest index page with a pointer to the index page we're going to
+		 * add, so we must read and pin that page.
+		 *
+		 * The names "prevblock" and "prevbuffer" are intended to signify that
+		 * what is currently the newest index segment will become the previous
+		 * segment relative to the one we're going to add.
+		 */
+		if (insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT)
+		{
+			prevblock = cb_segment_to_block(cb->cb_pages_per_segment,
+											newest_index_segment, 0);
+			prevbuffer = ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_SHARE);
+		}
+
+		/*
+		 * If we need to add a new segment of either type, make provisions to
+		 * do so.
+		 */
 		if (insert_state == CBM_INSERT_NEEDS_PAYLOAD_SEGMENT ||
 			insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT)
 		{
@@ -421,7 +499,14 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 
 						buffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork,
 													P_NEW, RBM_NORMAL, NULL);
-						ReleaseBuffer(buffer);
+						if (nblocks < free_block ||
+							insert_state != CBM_INSERT_NEEDS_INDEX_SEGMENT)
+							ReleaseBuffer(buffer);
+						else
+						{
+							indexblock = nblocks;
+							indexbuffer = buffer;
+						}
 						++nblocks;
 					}
 				}
@@ -435,16 +520,15 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			}
 		}
 
-		if (insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT)
-		{
-			elog(ERROR, "XXX creating index segments is not implemented yet");
-		}
-
 		/*
 		 * Prepare for next attempt by reacquiring all relevant buffer locks,
 		 * except for the one on the metapage, which is acquired at the top of
 		 * the loop.
 		 */
+		if (BufferIsValid(indexbuffer))
+			LockBuffer(indexbuffer, BUFFER_LOCK_EXCLUSIVE);
+		if (BufferIsValid(prevbuffer))
+			LockBuffer(prevbuffer, BUFFER_LOCK_EXCLUSIVE);
 		if (BufferIsValid(fsmbuffer))
 			LockBuffer(fsmbuffer, BUFFER_LOCK_EXCLUSIVE);
 	}
