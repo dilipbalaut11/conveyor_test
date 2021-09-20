@@ -145,3 +145,22 @@ determined the location of a payload page can release all buffer locks,
 retaining just a pin on the metapage, before reading and locking the
 target page. Otherwise, nothing would prevent the segment containing
 that page from being concurrently recycled.
+
+Buffer Lock Ordering
+--------------------
+
+Various parts of the code need to acquire multiple buffer locks
+simultaneously, and must do so in a consistent order to avoid deadlock. We
+use this ordering:
+
+1. Any new page that we're about to allocate.
+2. Any payload page.
+3. Any index pages.
+4. Any FSM page.
+5. The metapage.
+
+It might seem strange to lock the metapage last, because we typically need
+to examine it before doing much of anything. However, after we examine it,
+we typically want to read other pages, and we don't want to retain the
+buffer lock while doing I/O.  Instead, we release the buffer lock and then
+reacquire it at the end, after we've got all the other locks we need.
