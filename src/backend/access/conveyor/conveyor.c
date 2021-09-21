@@ -131,7 +131,7 @@ ConveyorBeltOpen(Relation rel, ForkNumber fork, MemoryContext mcxt)
  *
  * The intended use of this function is:
  *
- * buffer = ConveyorBeltPrepareInsert(cb, &pageno);
+ * buffer = ConveyorBeltGetNewPage(cb, &pageno);
  * page = BufferGetPage(buffer);
  * START_CRIT_SECTION();
  * // set page contents
