@@ -39,10 +39,8 @@ cb_create_metapage(RelFileNode *rnode,
 				   bool needs_xlog)
 {
 	Page		metapage;
-	CBMetapageData *meta;
 
 	metapage = BufferGetPage(metabuffer);
-	meta = cb_metapage_get_special(metapage);
 	cb_metapage_initialize(metapage, pages_per_segment);
 
 	if (needs_xlog)
