@@ -256,6 +256,17 @@ cb_metapage_advance_oldest_logical_page(CBMetapageData *meta,
 }
 
 /*
+ * Get the oldest and next logical page numbers for this conveyor belt.
+ */
+void
+cb_metapage_get_bounds(CBMetapageData *meta, CBPageNo *oldest_logical_page,
+					   CBPageNo *next_logical_page)
+{
+	*oldest_logical_page = meta->cbm_oldest_logical_page;
+	*next_logical_page = meta->cbm_next_logical_page;
+}
+
+/*
  * Compute the number of index entries that are used in the metapage.
  *
  * For our purposes here, an index entry isn't used unless there are some

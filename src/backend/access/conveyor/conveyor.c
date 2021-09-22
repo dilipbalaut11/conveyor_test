@@ -794,6 +794,30 @@ ConveyorBeltReadBuffer(ConveyorBelt *cb, CBPageNo pageno, int mode,
 }
 
 /*
+ * Find out which logical page numbers are currently valid.
+ *
+ * On return, *oldest_logical_page will be set to the smallest page number
+ * that has not yet been removed by truncation, and *next_logical_page will
+ * be set to the smallest page number that does not yet exist.
+ *
+ * Note that, unless the caller knows that there cannot be concurrent
+ * truncations or insertions in progress, either value might be out of
+ * date by the time it is used.
+ */
+void
+ConveyorBeltGetBounds(ConveyorBelt *cb, CBPageNo *oldest_logical_page,
+					  CBPageNo *next_logical_page)
+{
+	Buffer		metabuffer;
+	CBMetapageData *meta;
+
+	metabuffer = ConveyorBeltRead(cb, CONVEYOR_METAPAGE, BUFFER_LOCK_SHARE);
+	meta = cb_metapage_get_special(BufferGetPage(metabuffer));
+	cb_metapage_get_bounds(meta, oldest_logical_page, next_logical_page);
+	UnlockReleaseBuffer(metabuffer);
+}
+
+/*
  * Convenience function to read and lock a block.
  */
 static Buffer

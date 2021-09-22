@@ -106,6 +106,9 @@ extern void cb_metapage_advance_next_logical_page(CBMetapageData *meta,
 												  BlockNumber blkno);
 extern void cb_metapage_advance_oldest_logical_page(CBMetapageData *meta,
 													CBPageNo oldest_logical_page);
+extern void cb_metapage_get_bounds(CBMetapageData *meta,
+								   CBPageNo *oldest_logical_page,
+								   CBPageNo *next_logical_page);
 extern int	cb_metapage_get_index_entries_used(CBMetapageData *meta);
 extern void cb_metapage_add_index_entry(CBMetapageData *meta, CBSegNo segno);
 extern void cb_metapage_remove_index_entries(CBMetapageData *meta, int count,

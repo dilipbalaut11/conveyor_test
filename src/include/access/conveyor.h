@@ -37,6 +37,9 @@ extern void ConveyorBeltCleanupInsert(ConveyorBelt *cb, Buffer buffer);
 extern Buffer ConveyorBeltReadBuffer(ConveyorBelt *cb, CBPageNo pageno,
 									 int mode,
 									 BufferAccessStrategy strategy);
+extern void ConveyorBeltGetBounds(ConveyorBelt *cb,
+								  CBPageNo *oldest_logical_page,
+								  CBPageNo *next_logical_page);
 extern void ConveyorBeltTruncate(ConveyorBelt *cb, CBPageNo oldest_keeper);
 extern void ConveyorBeltVacuum(ConveyorBelt *cb);
 extern void ConveyorBeltCompact(ConveyorBelt *cb);
