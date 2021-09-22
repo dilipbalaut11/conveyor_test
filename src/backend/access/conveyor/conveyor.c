@@ -378,7 +378,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		 */
 		if (insert_state == CBM_INSERT_OK)
 		{
-			buffer = ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_SHARE);
+			buffer = ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_EXCLUSIVE);
 			if (PageIsNew(BufferGetPage(buffer)))
 			{
 				/*
