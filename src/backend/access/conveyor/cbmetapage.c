@@ -467,24 +467,19 @@ CBSegNo
 cb_metapage_find_free_segment(CBMetapageData *meta)
 {
 	unsigned	i;
+	unsigned	j;
 
-	StaticAssertStmt(CB_METAPAGE_FREESPACE_BYTES % sizeof(uint64) == 0,
-					 "CB_METAPAGE_FREESPACE_BYTES should be a multiple of 8");
-
-	for (i = 0; i < CB_METAPAGE_FREESPACE_BYTES; i += sizeof(uint64))
+	for (i = 0; i < CB_METAPAGE_FREESPACE_BYTES; ++i)
 	{
-		uint64		word = *(uint64 *) &meta->cbm_freespace_map[i];
+		uint8	b = meta->cbm_freespace_map[i];
 
-		if (word != PG_UINT64_MAX)
+		if (b == 0xFF)
+			continue;
+
+		for (j = 0; j < BITS_PER_BYTES; ++j)
 		{
-			uint64		flipword = ~word;
-			int			b = fls((int) flipword);
-
-			if (b == 0)
-				b = 32 + fls((int) (flipword >> 32));
-
-			Assert(b >= 1 && b <= 64);
-			return (i * BITS_PER_BYTE) + (b - 1);
+			if ((b & (1 << j)) == 0)
+				return (i * BITS_PER_BYTE) + j;
 		}
 	}
 
