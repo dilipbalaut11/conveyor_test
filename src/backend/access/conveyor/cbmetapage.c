@@ -476,7 +476,7 @@ cb_metapage_find_free_segment(CBMetapageData *meta)
 		if (b == 0xFF)
 			continue;
 
-		for (j = 0; j < BITS_PER_BYTES; ++j)
+		for (j = 0; j < BITS_PER_BYTE; ++j)
 		{
 			if ((b & (1 << j)) == 0)
 				return (i * BITS_PER_BYTE) + j;
