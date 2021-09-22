@@ -269,8 +269,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		 * size of the relation on disk is large enough.
 		 */
 		can_allocate_segment =
-			(insert_state != CBM_INSERT_NEEDS_PAYLOAD_SEGMENT
-			 || insert_state != CBM_INSERT_NEEDS_INDEX_SEGMENT) &&
+			(insert_state == CBM_INSERT_NEEDS_PAYLOAD_SEGMENT
+			 || insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT) &&
 			mode == BUFFER_LOCK_EXCLUSIVE &&
 			(free_segno != CB_INVALID_SEGMENT) &&
 			(free_segno < next_segno ||
@@ -282,9 +282,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		 * locks.
 		 */
 		if (can_allocate_segment &&
-			insert_state != CBM_INSERT_NEEDS_INDEX_SEGMENT &&
-			!BufferIsValid(indexbuffer) &&
-			!BufferIsValid(prevbuffer))
+			insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT &&
+			(!BufferIsValid(indexbuffer) || !BufferIsValid(prevbuffer)))
 			can_allocate_segment = false;
 
 		/*
