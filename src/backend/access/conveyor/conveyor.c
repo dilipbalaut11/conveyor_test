@@ -389,22 +389,20 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		}
 		else
 		{
-			BlockNumber	possibly_not_on_disk_blkno;
+			BlockNumber possibly_not_on_disk_blkno;
 
 			/*
 			 * The current payload segment is not full, but if it's the last
-			 * segment in the conveyor belt, the page we need may not yet exist
-			 * on disk.
+			 * segment in the conveyor belt, the page we need may not yet
+			 * exist on disk.
 			 *
-			 * We know if we get to this point that at least one segment
-			 * exists, so possibly_not_on_disk_segno can't be 0. The previous
-			 * segment's first page must exist on disk, but the later pages
-			 * may not.
+			 * The previous segment's first page must exist on disk, but the
+			 * later pages may not.
 			 */
-			Assert(possibly_not_on_disk_segno > 0);
 			possibly_not_on_disk_blkno =
 				cb_segment_to_block(cb->cb_pages_per_segment,
-									possibly_not_on_disk_segno - 1, 1);
+									possibly_not_on_disk_segno, 0)
+				- cb->cb_pages_per_segment + 1;
 
 			/* Extend the relation if needed. */
 			buffer = InvalidBuffer;
@@ -417,10 +415,10 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				nblocks = RelationGetNumberOfBlocksInFork(cb->cb_rel,
 														  cb->cb_fork);
 				if (next_blkno > nblocks)
-						ereport(ERROR,
-								errcode(ERRCODE_DATA_CORRUPTED),
-								errmsg_internal("next block should be %u but relation has only %u blocks",
-												next_blkno, nblocks));
+					ereport(ERROR,
+							errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg_internal("next block should be %u but relation has only %u blocks",
+											next_blkno, nblocks));
 				else if (next_blkno == nblocks)
 				{
 					buffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork,

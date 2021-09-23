@@ -119,7 +119,7 @@ cb_metapage_find_logical_page(CBMetapageData *meta,
 
 	/* Index entry must be in the metapage, if it exists at all. */
 	segno = meta->cbm_index[relp / meta->cbm_pages_per_segment];
-	segoff = meta->cbm_pages_per_segment;
+	segoff = relp % meta->cbm_pages_per_segment;
 	if (segno == CB_INVALID_SEGMENT)
 		return false;
 
