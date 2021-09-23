@@ -422,8 +422,11 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 								errmsg_internal("next block should be %u but relation has only %u blocks",
 												next_blkno, nblocks));
 				else if (next_blkno == nblocks)
+				{
 					buffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork,
 												P_NEW, RBM_NORMAL, NULL);
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				}
 				UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
 			}
 
