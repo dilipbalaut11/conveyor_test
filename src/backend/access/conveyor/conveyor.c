@@ -246,6 +246,14 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 													&newest_index_segment);
 
 		/*
+		 * All existing segments must be on disk.
+		 *
+		 * (The last one might be partial, but that's OK.)
+		 */
+		if (next_segno > possibly_not_on_disk_segno)
+			possibly_not_on_disk_segno = next_segno;
+
+		/*
 		 * If we need to allocate a payload or index segment, and we don't
 		 * currently have a candidate, check whether the metapage knows of a
 		 * free segment.
@@ -273,8 +281,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			 || insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT) &&
 			mode == BUFFER_LOCK_EXCLUSIVE &&
 			(free_segno != CB_INVALID_SEGMENT) &&
-			(free_segno < next_segno ||
-			 free_segno < possibly_not_on_disk_segno);
+			(free_segno < possibly_not_on_disk_segno);
 
 		/*
 		 * If it still looks like we can allocate, check for the case where we
@@ -370,15 +377,66 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			fsmbuffer = InvalidBuffer;
 		}
 
-		/*
-		 * If, according to the metapage, there is a current payload segment
-		 * that is not full, we can just lock the target buffer. If it's still
-		 * new, we're done. Otherwise, someone else grabbed that page before
-		 * we did, so we must retry.
-		 */
-		if (insert_state == CBM_INSERT_OK)
+		if (insert_state != CBM_INSERT_OK)
 		{
-			buffer = ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_EXCLUSIVE);
+			/*
+			 * Some sort of preparatory work will be needed in order to insert
+			 * a new page, which will require modifying the metapage.
+			 * Therefore, next time we lock it, we had better grab an
+			 * exclusive lock.
+			 */
+			mode = BUFFER_LOCK_EXCLUSIVE;
+		}
+		else
+		{
+			BlockNumber	possibly_not_on_disk_blkno;
+
+			/*
+			 * The current payload segment is not full, but if it's the last
+			 * segment in the conveyor belt, the page we need may not yet exist
+			 * on disk.
+			 *
+			 * We know if we get to this point that at least one segment
+			 * exists, so possibly_not_on_disk_segno can't be 0. The previous
+			 * segment's first page must exist on disk, but the later pages
+			 * may not.
+			 */
+			Assert(possibly_not_on_disk_segno > 0);
+			possibly_not_on_disk_blkno =
+				cb_segment_to_block(cb->cb_pages_per_segment,
+									possibly_not_on_disk_segno - 1, 1);
+
+			/* Extend the relation if needed. */
+			buffer = InvalidBuffer;
+			if (next_blkno >= possibly_not_on_disk_blkno)
+			{
+				BlockNumber nblocks;
+
+				/* Allocating the next segment so might need to extend. */
+				LockRelationForExtension(cb->cb_rel, ExclusiveLock);
+				nblocks = RelationGetNumberOfBlocksInFork(cb->cb_rel,
+														  cb->cb_fork);
+				if (next_blkno > nblocks)
+						ereport(ERROR,
+								errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg_internal("next block should be %u but relation has only %u blocks",
+												next_blkno, nblocks));
+				else if (next_blkno == nblocks)
+					buffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork,
+												P_NEW, RBM_NORMAL, NULL);
+				UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
+			}
+
+			/* If we didn't extend the relation, just read the buffer. */
+			if (!BufferIsValid(buffer))
+				buffer =
+					ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_EXCLUSIVE);
+
+			/*
+			 * If the target buffer is still new, we're done. Otherwise,
+			 * someone else grabbed that page before we did, so we must fall
+			 * through and retry.
+			 */
 			if (PageIsNew(BufferGetPage(buffer)))
 			{
 				/*
@@ -393,16 +451,6 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				/* Success, so escape toplevel retry loop. */
 				break;
 			}
-		}
-		else
-		{
-			/*
-			 * Some sort of preparatory work will be needed in order to insert
-			 * a new page, which will require modifying the metapage.
-			 * Therefore, next time we lock it, we had better grab an
-			 * exclusive lock.
-			 */
-			mode = BUFFER_LOCK_EXCLUSIVE;
 		}
 
 		/*
@@ -470,6 +518,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				BlockNumber free_block;
 
 				/* Allocating the next segment so might need to extend. */
+				LockRelationForExtension(cb->cb_rel, ExclusiveLock);
 				nblocks = RelationGetNumberOfBlocksInFork(cb->cb_rel,
 														  cb->cb_fork);
 				free_block = cb_segment_to_block(cb->cb_pages_per_segment,
@@ -509,6 +558,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 						++nblocks;
 					}
 				}
+				UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
 
 				/*
 				 * The first page of this segment, at least, is now known to
