@@ -280,8 +280,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			(insert_state == CBM_INSERT_NEEDS_PAYLOAD_SEGMENT
 			 || insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT) &&
 			mode == BUFFER_LOCK_EXCLUSIVE &&
-			(free_segno != CB_INVALID_SEGMENT) &&
-			(free_segno < possibly_not_on_disk_segno);
+			free_segno != CB_INVALID_SEGMENT &&
+			free_segno < possibly_not_on_disk_segno;
 
 		/*
 		 * If it still looks like we can allocate, check for the case where we
@@ -421,11 +421,17 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 											next_blkno, nblocks));
 				else if (next_blkno == nblocks)
 				{
+					/* relase extension lock before locking buffer */
 					buffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork,
 												P_NEW, RBM_NORMAL, NULL);
+					UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
 					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 				}
-				UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
+				else
+				{
+					/* we don't need to extend */
+					UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
+				}
 			}
 
 			/* If we didn't extend the relation, just read the buffer. */
