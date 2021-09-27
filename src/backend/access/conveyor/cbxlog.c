@@ -180,6 +180,89 @@ cb_xlog_allocate_index_segment(XLogReaderState *record)
 }
 
 /*
+ * REDO function for cb_allocate_index_page.
+ */
+static void
+cb_xlog_allocate_index_page(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_cb_allocate_index_page *xlrec;
+	Buffer		indexbuffer;
+	Buffer		firstindexbuffer;
+
+	xlrec = (xl_cb_allocate_index_page *) XLogRecGetData(record);
+
+	/* NB: new index buffer should come first due to lock ordering rules */
+	if (XLogReadBufferForRedo(record, 0, &indexbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	indexpage = BufferGetPage(indexbuffer);
+
+		cb_indexpage_initialize(indexpage, xlrec->pageno, false);
+		PageSetLSN(indexpage, lsn);
+		MarkBufferDirty(indexbuffer);
+	}
+
+	if (XLogReadBufferForRedo(record, 1, &firstindexbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	firstindexpage = BufferGetPage(firstindexbuffer);
+
+		cb_indexpage_increment_pages_initialized(firstindexpage);
+		PageSetLSN(firstindexpage, lsn);
+		MarkBufferDirty(firstindexbuffer);
+	}
+
+	if (BufferIsValid(indexbuffer))
+		UnlockReleaseBuffer(indexbuffer);
+	if (BufferIsValid(firstindexbuffer))
+		UnlockReleaseBuffer(firstindexbuffer);
+}
+
+/*
+ * REDO function for cb_relocate_index_entries.
+ */
+static void
+cb_xlog_relocate_index_entries(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_cb_relocate_index_entries *xlrec;
+	Buffer		metabuffer;
+	Buffer		indexbuffer;
+
+	xlrec = (xl_cb_relocate_index_entries *) XLogRecGetData(record);
+
+	/* NB: metapage must be last due to lock ordering rules */
+	if (XLogReadBufferForRedo(record, 1, &indexbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	indexpage = BufferGetPage(indexbuffer);
+
+		cb_indexpage_add_index_entries(indexpage, xlrec->pageno,
+									   xlrec->num_index_entries,
+									   xlrec->index_entries,
+									   xlrec->pages_per_segment);
+		cb_indexpage_initialize(indexpage, xlrec->pageno, false);
+		PageSetLSN(indexpage, lsn);
+		MarkBufferDirty(indexbuffer);
+	}
+
+	/* NB: metapage must be last due to lock ordering rules */
+	if (XLogReadBufferForRedo(record, 0, &metabuffer) == BLK_NEEDS_REDO)
+	{
+		Page	metapage = BufferGetPage(metabuffer);
+		CBMetapageData *meta;
+
+		meta = cb_metapage_get_special(metapage);
+		cb_metapage_remove_index_entries(meta, xlrec->num_index_entries, true);
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
+
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
+	if (BufferIsValid(indexbuffer))
+		UnlockReleaseBuffer(indexbuffer);
+}
+
+/*
  * Main entrypoint for conveyor belt REDO.
  */
 void
@@ -197,6 +280,12 @@ conveyor_redo(XLogReaderState *record)
 			break;
 		case XLOG_CONVEYOR_ALLOCATE_INDEX_SEGMENT:
 			cb_xlog_allocate_index_segment(record);
+			break;
+		case XLOG_CONVEYOR_ALLOCATE_INDEX_PAGE:
+			cb_xlog_allocate_index_page(record);
+			break;
+		case XLOG_CONVEYOR_RELOCATE_INDEX_ENTRIES:
+			cb_xlog_relocate_index_entries(record);
 			break;
 		default:
 			elog(PANIC, "conveyor_redo: unknown op code %u", info);

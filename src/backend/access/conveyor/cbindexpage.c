@@ -75,26 +75,34 @@ cb_indexpage_find_logical_page(Page page, CBPageNo pageno,
 }
 
 /*
- * Add an index entry covering 'pageno' and pointing to 'segno' to 'page'.
+ * Add index entries for logical pages beginning at 'pageno'.
  *
- * It is the caller's responsibility to supply the correct index page.
+ * It is the caller's responsibility to supply the correct index page, and
+ * to make sure that there is enough room for the entries to be added.
  */
 void
-cb_indexpage_add_index_entry(Page page, CBPageNo pageno, CBSegNo segno,
-							 uint16 pages_per_segment)
+cb_indexpage_add_index_entries(Page page,
+							   CBPageNo pageno,
+							   unsigned num_index_entries,
+							   CBSegNo *index_entries,
+							   uint16 pages_per_segment)
 {
 	CBIndexPageData *ipd = cb_indexpage_get_special(page);
 	unsigned	offset;
 
+	if (num_index_entries < 1 || num_index_entries > CB_INDEXPAGE_INDEX_ENTRIES)
+		elog(ERROR, "can't add %u index entries to an index page",
+			 num_index_entries);
 	if (pageno < ipd->cbidx_first_page)
-		elog(ERROR, "can't add index entry for page " UINT64_FORMAT " on an index page that starts at page " UINT64_FORMAT,
+		elog(ERROR, "can't add index entries starting with page " UINT64_FORMAT " to an index page that starts at page " UINT64_FORMAT,
 			 pageno, ipd->cbidx_first_page);
 	offset = (pageno - ipd->cbidx_first_page) / pages_per_segment;
-	if (offset > CB_INDEXPAGE_INDEX_ENTRIES)
-		elog(ERROR, "can't find index entry for page " UINT64_FORMAT " on an index page that starts at page " UINT64_FORMAT,
-			 pageno, ipd->cbidx_first_page);
+	if (offset + num_index_entries >= CB_INDEXPAGE_INDEX_ENTRIES)
+		elog(ERROR, "can't place %u index entries starting with page " UINT64_FORMAT " on an index page that starts at page " UINT64_FORMAT,
+			 num_index_entries, pageno, ipd->cbidx_first_page);
 
-	ipd->cbidx_entry[offset] = segno;
+	memcpy(&ipd->cbidx_entry[offset], index_entries,
+		   num_index_entries * sizeof(CBSegNo));
 }
 
 /*
@@ -139,7 +147,7 @@ cb_indexpage_get_next_segment(Page page)
  * that's where the count is stored.
  */
 void
-cb_indexpage_increment_pages_initalized(Page page)
+cb_indexpage_increment_pages_initialized(Page page)
 {
 	CBIndexPageData *ipd = cb_indexpage_get_special(page);
 
@@ -157,7 +165,7 @@ cb_indexpage_increment_pages_initalized(Page page)
  * that's where the count is stored.
  */
 void
-cb_indexpage_decrement_pages_initalized(Page page)
+cb_indexpage_decrement_pages_initialized(Page page)
 {
 	CBIndexPageData *ipd = cb_indexpage_get_special(page);
 

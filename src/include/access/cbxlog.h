@@ -22,6 +22,8 @@
 #define XLOG_CONVEYOR_INSERT_PAYLOAD_PAGE			0x10
 #define	XLOG_CONVEYOR_ALLOCATE_PAYLOAD_SEGMENT		0x20
 #define	XLOG_CONVEYOR_ALLOCATE_INDEX_SEGMENT		0x30
+#define	XLOG_CONVEYOR_ALLOCATE_INDEX_PAGE			0x40
+#define XLOG_CONVEYOR_RELOCATE_INDEX_ENTRIES		0x50
 
 typedef struct xl_cb_allocate_payload_segment
 {
@@ -29,12 +31,37 @@ typedef struct xl_cb_allocate_payload_segment
 	bool		is_extend;
 } xl_cb_allocate_payload_segment;
 
+#define SizeOfCBAllocatePayloadSegment \
+	(offsetof(xl_cb_allocate_payload_segment, is_extend) + sizeof(bool))
+
 typedef struct xl_cb_allocate_index_segment
 {
 	CBSegNo		segno;
 	CBPageNo	pageno;
 	bool		is_extend;
 } xl_cb_allocate_index_segment;
+
+#define SizeOfCBAllocateIndexSegment \
+	(offsetof(xl_cb_allocate_index_segment, is_extend) + sizeof(bool))
+
+typedef struct xl_cb_allocate_index_page
+{
+	CBPageNo	pageno;
+} xl_cb_allocate_index_page;
+
+#define SizeOfCBAllocateIndexPage \
+	(offsetof(xl_cb_allocate_index_page, pageno) + sizeof(CBPageNo))
+
+typedef struct xl_cb_relocate_index_entries
+{
+	CBPageNo	pageno;
+	unsigned	num_index_entries;
+	uint16		pages_per_segment;
+	CBSegNo		index_entries[FLEXIBLE_ARRAY_MEMBER];
+} xl_cb_relocate_index_entries;
+
+#define SizeOfCBRelocateIndexEntries \
+	(offsetof(xl_cb_relocate_index_entries, index_entries))
 
 extern void conveyor_desc(StringInfo buf, XLogReaderState *record);
 extern void conveyor_redo(XLogReaderState *record);

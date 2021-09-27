@@ -333,7 +333,7 @@ cb_metapage_add_index_entry(CBMetapageData *meta, CBSegNo segno)
  * make more space in the metapage. In that case, pass relocating = true.
  */
 void
-cb_metapage_remove_index_entries(CBMetapageData *meta, int count,
+cb_metapage_remove_index_entries(CBMetapageData *meta, unsigned count,
 								 bool relocating)
 {
 	int			used = cb_metapage_get_index_entries_used(meta);
