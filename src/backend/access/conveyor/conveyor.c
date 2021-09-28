@@ -307,6 +307,15 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			else
 				can_allocate_segment =
 					!cb_metapage_get_fsm_bit(meta, free_segno);
+
+			/*
+			 * If this segment turned out not to be free, we need a new
+			 * candidate. Check the metapage here, and if that doesn't work
+			 * out, free_segno will end up as CB_INVALID_SEGMENT, and we'll
+			 * search the FSM pages further down.
+			 */
+			if (!can_allocate_segment)
+				free_segno = cb_metapage_find_free_segment(meta);
 		}
 
 		/* If it STILL looks like we can allocate, do it! */
@@ -500,31 +509,28 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				free_segno = ConveyorSearchFSMPages(cb, next_segno, &fsmblock,
 													&fsmbuffer);
 
-			/*
-			 * At least the first page of a segment must exist on disk before
-			 * we're allowed to allocate it, so we may need to extend the
-			 * relation.
-			 */
 			if (free_segno > next_segno)
 			{
 				/*
-				 * If the FSM thinks that we ought to allocate a new segment,
-				 * it should be the very next one. If not, something has gone
-				 * horribly wrong - somehow we must have thought that a
-				 * segment that has never been allocated isn't actually free!
+				 * If the FSM thinks that we ought to allocate a segment
+				 * beyond what we think to be the very next one, then someone
+				 * else must have concurrently added a segment, so we'll need
+				 * to loop around, retake the metapage lock, refresh our
+				 * knowledge of next_segno, and then find a new segment to
+				 * allocate.
 				 */
-				ereport(ERROR,
-						errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg_internal("free segment is %u but next segment is only %u",
-										free_segno, next_segno));
-
+				free_segno = CB_INVALID_SEGMENT;
 			}
 			else if (free_segno == next_segno)
 			{
 				BlockNumber nblocks;
 				BlockNumber free_block;
 
-				/* Allocating the next segment so might need to extend. */
+				/*
+				 * We're allocating a new segment. At least the first page must
+				 * exist on disk before we perform the allocation, which means
+				 * we may need to add blocks to the relation fork.
+				 */
 				LockRelationForExtension(cb->cb_rel, ExclusiveLock);
 				nblocks = RelationGetNumberOfBlocksInFork(cb->cb_rel,
 														  cb->cb_fork);
