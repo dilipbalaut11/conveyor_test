@@ -500,7 +500,7 @@ cb_metapage_get_fsm_bit(CBMetapageData *meta, CBSegNo segno)
 
 	byte = meta->cbm_freespace_map[segno / BITS_PER_BYTE];
 	mask = 1 << (segno % BITS_PER_BYTE);
-	return (segno & mask) != 0;
+	return (byte & mask) != 0;
 }
 
 /*
