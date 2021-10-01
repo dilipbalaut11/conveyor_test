@@ -85,6 +85,7 @@ extern void cb_relocate_index_entries(RelFileNode *rnode,
 									  unsigned pageoffset,
 									  unsigned num_index_entries,
 									  CBSegNo *index_entries,
+									  CBPageNo index_page_start,
 									  bool needs_xlog);
 
 #endif							/* CBMODIFY_H */

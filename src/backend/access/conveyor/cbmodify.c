@@ -372,9 +372,11 @@ cb_allocate_index_page(RelFileNode *rnode,
  * Relocate index entries from the metapage to a page in an index segment,
  * and optionally write XLOG for the change.
  *
- * 'pageno' is the logical page number for the first index entry that we're
- * relocating. It is needed to figure out where to place the index entries
- * on the index page.
+ * 'pageoffset' is the offset within the index page where the new entries
+ * should be placed.
+ *
+ * 'index_page_start' is the first logical page number covered by the index
+ * page being modified.
  *
  * See cb_xlog_allocate_index_segment for the corresponding REDO routine.
  */
@@ -387,6 +389,7 @@ cb_relocate_index_entries(RelFileNode *rnode,
 						  unsigned pageoffset,
 						  unsigned num_index_entries,
 						  CBSegNo *index_entries,
+						  CBPageNo index_page_start,
 						  bool needs_xlog)
 {
 	Page		metapage;
@@ -400,6 +403,10 @@ cb_relocate_index_entries(RelFileNode *rnode,
 
 	START_CRIT_SECTION();
 
+	/* If these are the first entries on the page, initialize it. */
+	if (pageoffset == 0)
+		cb_indexpage_initialize(indexpage, index_page_start);
+
 	cb_indexpage_add_index_entries(indexpage, pageoffset, num_index_entries,
 								   index_entries);
 	cb_metapage_remove_index_entries(meta, num_index_entries, true);
@@ -408,15 +415,19 @@ cb_relocate_index_entries(RelFileNode *rnode,
 	{
 		xl_cb_relocate_index_entries xlrec;
 		XLogRecPtr	lsn;
+		uint8		flags = REGBUF_STANDARD;
 
 		xlrec.pageoffset = pageoffset;
 		xlrec.num_index_entries = num_index_entries;
+		xlrec.index_page_start = index_page_start;
+
+		if (pageoffset == 0)
+			flags |= REGBUF_WILL_INIT;
 
 		XLogBeginInsert();
 		XLogRegisterBlock(0, rnode, fork, CONVEYOR_METAPAGE, metapage,
 						  REGBUF_STANDARD);
-		XLogRegisterBlock(1, rnode, fork, indexblock, indexpage,
-						  REGBUF_STANDARD);
+		XLogRegisterBlock(1, rnode, fork, indexblock, indexpage, flags);
 		XLogRegisterData((char *) &xlrec, SizeOfCBRelocateIndexEntries);
 		XLogRegisterData((char *) index_entries,
 						 num_index_entries * sizeof(CBSegNo));

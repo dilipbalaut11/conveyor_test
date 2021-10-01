@@ -223,6 +223,9 @@ cb_xlog_relocate_index_entries(XLogReaderState *record)
 	{
 		Page	indexpage = BufferGetPage(indexbuffer);
 
+		if (xlrec->pageoffset == 0)
+			cb_indexpage_initialize(indexpage, xlrec->index_page_start);
+
 		cb_indexpage_add_index_entries(indexpage, xlrec->pageoffset,
 									   xlrec->num_index_entries,
 									   xlrec->index_entries);

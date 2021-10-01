@@ -56,6 +56,7 @@ typedef struct xl_cb_relocate_index_entries
 {
 	unsigned	pageoffset;
 	unsigned	num_index_entries;
+	CBPageNo	index_page_start;
 	CBSegNo		index_entries[FLEXIBLE_ARRAY_MEMBER];
 } xl_cb_relocate_index_entries;
 

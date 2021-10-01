@@ -169,6 +169,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	bool		needs_xlog;
 	int			mode = BUFFER_LOCK_SHARE;
 	int			iterations_without_next_pageno_change = 0;
+	unsigned	lppip;
 
 	/*
 	 * It would be really bad if someone called this function a second time
@@ -177,6 +178,9 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	 */
 	Assert(!BufferIsValid(cb->cb_insert_metabuffer));
 	Assert(!BufferIsValid(cb->cb_insert_buffer));
+
+	/* Logical pages per index segment, and per index page. */
+	lppip = cb_logical_pages_per_index_page(cb->cb_pages_per_segment);
 
 	/* Do any changes we make here need to be WAL-logged? */
 	needs_xlog = RelationNeedsWAL(cb->cb_rel) || cb->cb_fork == INIT_FORKNUM;
@@ -398,6 +402,31 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			free_segno = CB_INVALID_SEGMENT;
 		}
 
+		/*
+		 * If we need to relocate index entries and if we have a lock on the
+		 * correct index block, then go ahead and do it.
+		 */
+		if (insert_state == CBM_INSERT_NEEDS_INDEX_ENTRIES_RELOCATED &&
+			next_blkno == indexblock)
+		{
+			unsigned	pageoffset;
+			unsigned	num_index_entries;
+			CBSegNo	   *index_entries;
+			CBPageNo	index_page_start;
+
+			pageoffset = index_metapage_start % lppip;
+			num_index_entries = Min(CB_METAPAGE_INDEX_ENTRIES,
+									CB_INDEXPAGE_INDEX_ENTRIES - pageoffset);
+			index_entries = cb_metapage_get_index_entry_pointer(meta);
+			index_page_start = index_metapage_start -
+				pageoffset * cb->cb_pages_per_segment;
+			cb_relocate_index_entries(cb->cb_insert_relfilenode, cb->cb_fork,
+									  metabuffer, indexblock, indexbuffer,
+									  pageoffset, num_index_entries,
+									  index_entries, index_page_start,
+									  needs_xlog);
+		}
+
 		/* Release buffer locks and, except for the metapage, also pins. */
 		LockBuffer(metabuffer, BUFFER_LOCK_UNLOCK);
 		if (BufferIsValid(indexbuffer))
@@ -503,12 +532,18 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		}
 
 		/*
-		 * If the metapage has no more space for index entries, we must move
-		 * some of the existing entries to an index segment.
+		 * If the metapage has no more space for index entries, but there's
+		 * an index segment into which some of the existing ones could be
+		 * moved, then cb_metapage_get_insert_state will have set next_blkno
+		 * to the point to the block to which index entries should be moved.
 		 */
 		if (insert_state == CBM_INSERT_NEEDS_INDEX_ENTRIES_RELOCATED)
 		{
-			elog(ERROR, "XXX relocating index entries is not implemented yet");
+			/* XXX this is bugged because it doesn't know about maybe
+			 * needing to extend the relation */
+			indexblock = next_blkno;
+			indexbuffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork,
+											 indexblock, RBM_NORMAL, NULL);
 		}
 
 		/*
@@ -524,7 +559,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		{
 			prevblock = cb_segment_to_block(cb->cb_pages_per_segment,
 											newest_index_segment, 0);
-			prevbuffer = ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_SHARE);
+			prevbuffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork,
+											prevblock, RBM_NORMAL, NULL);
 		}
 
 		/*
