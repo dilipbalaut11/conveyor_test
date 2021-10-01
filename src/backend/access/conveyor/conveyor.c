@@ -163,10 +163,12 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	Buffer		fsmbuffer = InvalidBuffer;
 	Buffer		buffer;
 	CBPageNo	next_pageno;
+	CBPageNo	previous_next_pageno = 0;
 	CBSegNo		free_segno = CB_INVALID_SEGMENT;
 	CBSegNo		possibly_not_on_disk_segno = 0;
 	bool		needs_xlog;
 	int			mode = BUFFER_LOCK_SHARE;
+	int			iterations_without_next_pageno_change = 0;
 
 	/*
 	 * It would be really bad if someone called this function a second time
@@ -244,6 +246,37 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 													&next_pageno, &next_segno,
 													&index_metapage_start,
 													&newest_index_segment);
+
+		/*
+		 * There's no fixed upper bound on how many times this loop could
+		 * iterate, because some other backend could be currently allocating
+		 * pages, and that could prevent us from succeeding in allocating a
+		 * page.
+		 *
+		 * However, if that's happening, the next logical page number should
+		 * keep increasing. In the absence of any increase in the next logical
+		 * page number, we might still need to iterate a few times, but
+		 * not very many. For example, we might read the page the first time
+		 * and realize that a new index segment is needed, create it on the
+		 * second pass, move index entries into it on the third pass, and
+		 * create a payload segment on the fourth pass, but then, barring
+		 * concurrent activity, we should succeed in allocating a page on the
+		 * next pass.
+		 *
+		 * Hence, if we loop a large number of times without a change in
+		 * the next_pageno value, there's probably a bug. Error out instead
+		 * of looping forever.
+		 */
+		if (next_pageno > previous_next_pageno)
+		{
+			previous_next_pageno = next_pageno;
+			iterations_without_next_pageno_change = 0;
+		}
+		else if (++iterations_without_next_pageno_change >= 10)
+			elog(ERROR,
+				 "unable to make progress allocating page "
+				 UINT64_FORMAT " (state = %d)",
+				 next_pageno, (int) insert_state);
 
 		/*
 		 * All existing segments must be on disk.
