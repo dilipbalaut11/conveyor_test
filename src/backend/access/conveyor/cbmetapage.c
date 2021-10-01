@@ -26,6 +26,7 @@
 #include "postgres.h"
 
 #include "access/cbfsmpage.h"
+#include "access/cbindexpage.h"
 #include "access/cbmetapage.h"
 #include "access/cbmetapage_format.h"
 
@@ -139,8 +140,11 @@ cb_metapage_find_logical_page(CBMetapageData *meta,
  * will be set to the segment number of the newest index segment, or
  * CB_INVALID_SEGMENT if there is none.
  *
- * If the return value is CBM_INSERT_OK, there is an unfilled payload segment,
- * and *blkno will be set to the block number of the first unused page in that
+ * If the return value is CBM_INSERT_OK, *blkno will be set to the block number
+ * of the first unused page in the unfilled payload segment.
+ *
+ * If the return value is CBM_INSERT_NEEDS_INDEX_ENTRIES_RELOCATED, *blkno
+ * will be set to the first not-entirely-filled page in the newest index
  * segment.
  */
 CBMInsertState
@@ -172,22 +176,38 @@ cb_metapage_get_insert_state(CBMetapageData *meta,
 	 * metapage that now precede the logical truncation point, but that would
 	 * require a cleanup lock on the metapage, and it normally isn't going to
 	 * be possible, because typically the last truncate operation will have
-	 * afterward done any such work that is possible. We might miss an
+	 * afterwards done any such work that is possible. We might miss an
 	 * opportunity in the case where the last truncate operation didn't clean
 	 * up fully, but hopefully that's rare enough that we don't need to stress
 	 * about it.
 	 *
 	 * If the newest index segment is already full, then a new index segment
 	 * will need to be created. Otherwise, some entries can be copied into the
-	 * existing index segment. To make things easier for the caller, there is
-	 * a metapage flag to tell us which situation prevails.
+	 * existing index segment.
 	 */
 	if (relp >= CB_METAPAGE_INDEX_ENTRIES * meta->cbm_pages_per_segment)
 	{
-		if ((meta->cbm_flags & CBM_FLAG_INDEX_SEGMENT_FULL) != 0)
+		unsigned	entries;
+		unsigned	maxentries;
+
+		entries = meta->cbm_entries_in_newest_index_segment;
+		maxentries = CB_INDEXPAGE_INDEX_ENTRIES * meta->cbm_pages_per_segment;
+
+		if (entries > maxentries)
+			elog(ERROR,
+				 "newest index segment listed as using %u of %u entries",
+				 entries, maxentries);
+		else if (entries == maxentries)
 			return CBM_INSERT_NEEDS_INDEX_SEGMENT;
 		else
+		{
+			/* Figure out which block should be targeted. */
+			*blkno = cb_segment_to_block(meta->cbm_pages_per_segment,
+										 meta->cbm_newest_index_segment,
+										 entries / CB_INDEXPAGE_INDEX_ENTRIES);
+
 			return CBM_INSERT_NEEDS_INDEX_ENTRIES_RELOCATED;
+		}
 	}
 
 	/* Compute current insertion segment and offset. */
@@ -374,7 +394,10 @@ cb_metapage_remove_index_entries(CBMetapageData *meta, unsigned count,
 	meta->cbm_index_metapage_start +=
 		count * meta->cbm_pages_per_segment;
 	if (relocating)
+	{
 		meta->cbm_index_start = meta->cbm_index_metapage_start;
+		meta->cbm_entries_in_newest_index_segment += count;
+	}
 }
 
 /*
@@ -425,6 +448,7 @@ void
 cb_metapage_add_index_segment(CBMetapageData *meta, CBSegNo segno)
 {
 	meta->cbm_newest_index_segment = segno;
+	meta->cbm_entries_in_newest_index_segment = 0;
 	if (meta->cbm_oldest_index_segment == CB_INVALID_SEGMENT)
 		meta->cbm_oldest_index_segment = segno;
 }

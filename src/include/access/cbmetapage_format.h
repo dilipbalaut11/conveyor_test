@@ -43,14 +43,10 @@ struct CBMetapageData
 	 * larger reduces the number of index and freespace map segments required
 	 * and decreases fragmentation at the storage level, but it also increases
 	 * the granularity of space reuse.
-	 *
-	 * cbm_flags stores flags. Currently, the only flag is
-	 * CBM_FLAG_INDEX_SEGMENT_FULL.
 	 */
 	uint32		cbm_magic;
 	uint32		cbm_version;
 	uint16		cbm_pages_per_segment;
-	uint16		cbm_flags;
 
 	/*
 	 * Logical start and end of the conveyor belt.
@@ -81,13 +77,11 @@ struct CBMetapageData
 	 * cbm_oldest_index_segment and cbm_newest_index_segment are the oldest
 	 * and newest index segments that exist. Both values will be
 	 * CB_INVALID_SEGMENT if there are no index segments. Otherwise, the
-	 * mapping for cbm_oldest_logical_page is stored in the first entry in the
+	 * mapping for cbm_index_start is stored in the first entry in the
 	 * first page of cbm_oldest_index_segment.
 	 *
-	 * Note that the end of the newest index segment will often be unused, and
-	 * its contents undefined. That's because new index entries are always
-	 * inserted directly into the metapage, and later moved into index
-	 * segments in bulk.
+	 * cbm_entries_in_newest_index_segment is the number of index entries
+	 * in the newest index segment, or 0 if there are no index segments.
 	 *
 	 * cbm_index_segments_moved is the total number of times in the history
 	 * of this conveyor belt that an index segment has been physically
@@ -102,6 +96,7 @@ struct CBMetapageData
 	CBPageNo	cbm_index_metapage_start;
 	CBSegNo		cbm_oldest_index_segment;
 	CBSegNo		cbm_newest_index_segment;
+	unsigned	cbm_entries_in_newest_index_segment;
 	uint64		cbm_index_segments_moved;
 	CBSegNo		cbm_next_segment;
 
@@ -111,13 +106,5 @@ struct CBMetapageData
 	CBSegNo		cbm_index[CB_METAPAGE_INDEX_ENTRIES];
 	uint8		cbm_freespace_map[CB_METAPAGE_FREESPACE_BYTES];
 };
-
-/*
- * Conveyor belt metapage flags.
- *
- * CBM_FLAG_INDEX_SEGMENT_FULL indicates that there is no room in the
- * newest index segment for any more index entries.
- */
-#define	CBM_FLAG_INDEX_SEGMENT_FULL			0x0001
 
 #endif

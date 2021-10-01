@@ -72,7 +72,7 @@ typedef struct CBMetapageData CBMetapageData;
  * in the metapage for additional index entries, but there is room in the
  * newest index segment for entries to be relocated from the metapage.
  *
- * CBM_INSERT_NEEDS_INDEX_ENTRY_SPACE means that there is no more room in
+ * CBM_INSERT_NEEDS_INDEX_SEGMENT means that there is no more room in
  * the metapage for additional index entries, and the newest index segment
  * is full, too.
  */
