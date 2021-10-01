@@ -36,20 +36,16 @@
 /*
  * Function prototypes.
  */
-extern void cb_indexpage_initialize(Page page, CBPageNo pageno,
-									bool first_in_segment);
+extern void cb_indexpage_initialize(Page page, CBPageNo pageno);
 extern BlockNumber cb_indexpage_find_logical_page(Page page,
 												  CBPageNo pageno,
 												  uint16 pages_per_segment);
 extern void cb_indexpage_add_index_entries(Page page,
-										   CBPageNo pageno,
+										   unsigned pageoffset,
 										   unsigned num_index_entries,
-										   CBSegNo *index_entries,
-										   uint16 pages_per_segment);
+										   CBSegNo *index_entries);
 extern void cb_indexpage_set_next_segment(Page page, CBSegNo segno);
 extern CBSegNo cb_indexpage_get_next_segment(Page page);
-extern void cb_indexpage_increment_pages_initialized(Page page);
-extern void cb_indexpage_decrement_pages_initialized(Page page);
 
 /*
  * How many index entries will fit into an index segment?

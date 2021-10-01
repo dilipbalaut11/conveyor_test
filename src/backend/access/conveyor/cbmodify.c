@@ -266,7 +266,7 @@ cb_allocate_index_segment(RelFileNode *rnode,
 	if (is_extend)
 		cb_metapage_increment_next_segment(meta, segno);
 
-	cb_indexpage_initialize(indexpage, pageno, true);
+	cb_indexpage_initialize(indexpage, pageno);
 	MarkBufferDirty(indexbuffer);
 
 	if (prevblock != InvalidBlockNumber)
@@ -336,21 +336,17 @@ cb_allocate_index_page(RelFileNode *rnode,
 					   ForkNumber fork,
 					   BlockNumber indexblock,
 					   Buffer indexbuffer,
-					   BlockNumber firstindexblock,
-					   Buffer firstindexbuffer,
 					   CBPageNo pageno,
 					   bool needs_xlog)
 {
 	Page		indexpage;
-	Page		firstindexpage;
 
 	indexpage = BufferGetPage(indexbuffer);
-	firstindexpage = BufferGetPage(firstindexbuffer);
 
 	START_CRIT_SECTION();
 
-	cb_indexpage_initialize(indexpage, pageno, false);
-	cb_indexpage_increment_pages_initialized(firstindexpage);
+	cb_indexpage_initialize(indexpage, pageno);
+	MarkBufferDirty(indexbuffer);
 
 	if (needs_xlog)
 	{
@@ -362,14 +358,11 @@ cb_allocate_index_page(RelFileNode *rnode,
 		XLogBeginInsert();
 		XLogRegisterBlock(0, rnode, fork, indexblock, indexpage,
 						  REGBUF_STANDARD | REGBUF_WILL_INIT);
-		XLogRegisterBlock(1, rnode, fork, firstindexblock,
-						  firstindexpage, REGBUF_STANDARD);
 		XLogRegisterData((char *) &xlrec, SizeOfCBAllocateIndexPage);
 		lsn = XLogInsert(RM_CONVEYOR_ID,
 						 XLOG_CONVEYOR_ALLOCATE_INDEX_PAGE);
 
 		PageSetLSN(indexpage, lsn);
-		PageSetLSN(firstindexpage, lsn);
 	}
 
 	END_CRIT_SECTION();
@@ -391,10 +384,9 @@ cb_relocate_index_entries(RelFileNode *rnode,
 						  Buffer metabuffer,
 						  BlockNumber indexblock,
 						  Buffer indexbuffer,
-						  CBPageNo pageno,
+						  unsigned pageoffset,
 						  unsigned num_index_entries,
 						  CBSegNo *index_entries,
-						  uint16 pages_per_segment,
 						  bool needs_xlog)
 {
 	Page		metapage;
@@ -408,8 +400,8 @@ cb_relocate_index_entries(RelFileNode *rnode,
 
 	START_CRIT_SECTION();
 
-	cb_indexpage_add_index_entries(indexpage, pageno, num_index_entries,
-								   index_entries, pages_per_segment);
+	cb_indexpage_add_index_entries(indexpage, pageoffset, num_index_entries,
+								   index_entries);
 	cb_metapage_remove_index_entries(meta, num_index_entries, true);
 
 	if (needs_xlog)
@@ -417,9 +409,8 @@ cb_relocate_index_entries(RelFileNode *rnode,
 		xl_cb_relocate_index_entries xlrec;
 		XLogRecPtr	lsn;
 
-		xlrec.pageno = pageno;
+		xlrec.pageoffset = pageoffset;
 		xlrec.num_index_entries = num_index_entries;
-		xlrec.pages_per_segment = pages_per_segment;
 
 		XLogBeginInsert();
 		XLogRegisterBlock(0, rnode, fork, CONVEYOR_METAPAGE, metapage,

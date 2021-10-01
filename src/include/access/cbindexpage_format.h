@@ -34,14 +34,6 @@ typedef struct CBIndexPageData
 	uint32		cbidx_magic;
 
 	/*
-	 * If this is the first page of an index segment, then this is the number
-	 * of pages in this segment that are initialized, at least 1 and up to
-	 * the number of pages per segment for this conveyor belt. If this is
-	 * not the first page of the index segment, then 0.
-	 */
-	uint16		cbidx_pages_initialized;
-
-	/*
 	 * If this is the first page of an index segment and there is at least one
 	 * index segment after this one, then this is the segment number of the
 	 * next such segment. Otherwise, it's CB_INVALID_SEGMENT.

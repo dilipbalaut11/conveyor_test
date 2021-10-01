@@ -74,8 +74,6 @@ extern void cb_allocate_index_page(RelFileNode *rnode,
 								   ForkNumber fork,
 								   BlockNumber indexblock,
 								   Buffer indexbuffer,
-								   BlockNumber firstindexblock,
-								   Buffer firstindexbuffer,
 								   CBPageNo pageno,
 								   bool needs_xlog);
 
@@ -84,10 +82,9 @@ extern void cb_relocate_index_entries(RelFileNode *rnode,
 									  Buffer metabuffer,
 									  BlockNumber indexblock,
 									  Buffer indexbuffer,
-									  CBPageNo pageno,
+									  unsigned pageoffset,
 									  unsigned num_index_entries,
 									  CBSegNo *index_entries,
-									  uint16 pages_per_segment,
 									  bool needs_xlog);
 
 #endif							/* CBMODIFY_H */

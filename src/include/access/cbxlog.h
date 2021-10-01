@@ -54,9 +54,8 @@ typedef struct xl_cb_allocate_index_page
 
 typedef struct xl_cb_relocate_index_entries
 {
-	CBPageNo	pageno;
+	unsigned	pageoffset;
 	unsigned	num_index_entries;
-	uint16		pages_per_segment;
 	CBSegNo		index_entries[FLEXIBLE_ARRAY_MEMBER];
 } xl_cb_relocate_index_entries;
 

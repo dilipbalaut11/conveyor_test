@@ -128,7 +128,7 @@ cb_xlog_allocate_index_segment(XLogReaderState *record)
 	{
 		Page	indexpage = BufferGetPage(indexbuffer);
 
-		cb_indexpage_initialize(indexpage, xlrec->pageno, true);
+		cb_indexpage_initialize(indexpage, xlrec->pageno);
 		PageSetLSN(indexpage, lsn);
 		MarkBufferDirty(indexbuffer);
 	}
@@ -188,7 +188,6 @@ cb_xlog_allocate_index_page(XLogReaderState *record)
 	XLogRecPtr	lsn = record->EndRecPtr;
 	xl_cb_allocate_index_page *xlrec;
 	Buffer		indexbuffer;
-	Buffer		firstindexbuffer;
 
 	xlrec = (xl_cb_allocate_index_page *) XLogRecGetData(record);
 
@@ -197,24 +196,13 @@ cb_xlog_allocate_index_page(XLogReaderState *record)
 	{
 		Page	indexpage = BufferGetPage(indexbuffer);
 
-		cb_indexpage_initialize(indexpage, xlrec->pageno, false);
+		cb_indexpage_initialize(indexpage, xlrec->pageno);
 		PageSetLSN(indexpage, lsn);
 		MarkBufferDirty(indexbuffer);
 	}
 
-	if (XLogReadBufferForRedo(record, 1, &firstindexbuffer) == BLK_NEEDS_REDO)
-	{
-		Page	firstindexpage = BufferGetPage(firstindexbuffer);
-
-		cb_indexpage_increment_pages_initialized(firstindexpage);
-		PageSetLSN(firstindexpage, lsn);
-		MarkBufferDirty(firstindexbuffer);
-	}
-
 	if (BufferIsValid(indexbuffer))
 		UnlockReleaseBuffer(indexbuffer);
-	if (BufferIsValid(firstindexbuffer))
-		UnlockReleaseBuffer(firstindexbuffer);
 }
 
 /*
@@ -235,11 +223,9 @@ cb_xlog_relocate_index_entries(XLogReaderState *record)
 	{
 		Page	indexpage = BufferGetPage(indexbuffer);
 
-		cb_indexpage_add_index_entries(indexpage, xlrec->pageno,
+		cb_indexpage_add_index_entries(indexpage, xlrec->pageoffset,
 									   xlrec->num_index_entries,
-									   xlrec->index_entries,
-									   xlrec->pages_per_segment);
-		cb_indexpage_initialize(indexpage, xlrec->pageno, false);
+									   xlrec->index_entries);
 		PageSetLSN(indexpage, lsn);
 		MarkBufferDirty(indexbuffer);
 	}
