@@ -157,6 +157,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	BlockNumber indexblock = InvalidBlockNumber;
 	BlockNumber prevblock = InvalidBlockNumber;
 	BlockNumber fsmblock = InvalidBlockNumber;
+	BlockNumber	possibly_not_on_disk_blkno = CONVEYOR_METAPAGE + 1;
 	Buffer		metabuffer;
 	Buffer		indexbuffer = InvalidBuffer;
 	Buffer		prevbuffer = InvalidBuffer;
@@ -165,7 +166,6 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	CBPageNo	next_pageno;
 	CBPageNo	previous_next_pageno = 0;
 	CBSegNo		free_segno = CB_INVALID_SEGMENT;
-	CBSegNo		possibly_not_on_disk_segno = 0;
 	bool		needs_xlog;
 	int			mode = BUFFER_LOCK_SHARE;
 	int			iterations_without_next_pageno_change = 0;
@@ -283,12 +283,19 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				 next_pageno, (int) insert_state);
 
 		/*
-		 * All existing segments must be on disk.
-		 *
-		 * (The last one might be partial, but that's OK.)
+		 * next_segno need not exist on disk, but at least the first block
+		 * of the previous segment should be there.
 		 */
-		if (next_segno > possibly_not_on_disk_segno)
-			possibly_not_on_disk_segno = next_segno;
+		if (next_segno > 0)
+		{
+			BlockNumber last_segno_first_blkno;
+
+			last_segno_first_blkno =
+				cb_segment_to_block(cb->cb_pages_per_segment,
+									next_segno - 1, 0);
+			if (last_segno_first_blkno > possibly_not_on_disk_blkno)
+				possibly_not_on_disk_blkno = last_segno_first_blkno + 1;
+		}
 
 		/*
 		 * If we need to allocate a payload or index segment, and we don't
@@ -313,12 +320,20 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		 * previously, but otherwise it's only true if we've verified that the
 		 * size of the relation on disk is large enough.
 		 */
-		can_allocate_segment =
-			(insert_state == CBM_INSERT_NEEDS_PAYLOAD_SEGMENT
-			 || insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT) &&
-			mode == BUFFER_LOCK_EXCLUSIVE &&
-			free_segno != CB_INVALID_SEGMENT &&
-			free_segno < possibly_not_on_disk_segno;
+		if (mode != BUFFER_LOCK_EXCLUSIVE ||
+			free_segno == CB_INVALID_SEGMENT ||
+			(insert_state != CBM_INSERT_NEEDS_PAYLOAD_SEGMENT
+			 && insert_state != CBM_INSERT_NEEDS_INDEX_SEGMENT))
+			can_allocate_segment = false;
+		else
+		{
+			BlockNumber	free_segno_first_blkno;
+
+			free_segno_first_blkno =
+				cb_segment_to_block(cb->cb_pages_per_segment, free_segno, 0);
+			can_allocate_segment =
+				(free_segno_first_blkno < possibly_not_on_disk_blkno);
+		}
 
 		/*
 		 * If it still looks like we can allocate, check for the case where we
@@ -460,21 +475,6 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		}
 		else
 		{
-			BlockNumber possibly_not_on_disk_blkno;
-
-			/*
-			 * The current payload segment is not full, but if it's the last
-			 * segment in the conveyor belt, the page we need may not yet
-			 * exist on disk.
-			 *
-			 * The previous segment's first page must exist on disk, but the
-			 * later pages may not.
-			 */
-			possibly_not_on_disk_blkno =
-				cb_segment_to_block(cb->cb_pages_per_segment,
-									possibly_not_on_disk_segno, 0)
-				- cb->cb_pages_per_segment + 1;
-
 			/* Extend the relation if needed. */
 			buffer = InvalidBuffer;
 			if (next_blkno >= possibly_not_on_disk_blkno)
@@ -501,6 +501,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				else
 				{
 					/* we don't need to extend */
+					possibly_not_on_disk_blkno = nblocks;
 					UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
 				}
 			}
@@ -642,12 +643,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				}
 				UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
 
-				/*
-				 * The first page of this segment, at least, is now known to
-				 * be on disk, either because we verified the length of the
-				 * relation fork, or because we extended it.
-				 */
-				possibly_not_on_disk_segno = free_segno + 1;
+				/* Update our notion of what blocks exist on disk. */
+				possibly_not_on_disk_blkno = nblocks;
 			}
 		}
 
