@@ -1,0 +1,5 @@
+# pg_conveyor test extension
+comment = 'test conveyor'
+default_version = '1.0'
+module_pathname = '$libdir/pg_conveyor'
+relocatable = true

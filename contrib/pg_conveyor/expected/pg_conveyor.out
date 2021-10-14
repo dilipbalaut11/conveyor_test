@@ -1,0 +1,65 @@
+CREATE EXTENSION pg_conveyor;
+CREATE TABLE test(a int);
+SELECT pg_conveyor_init('test'::regclass::oid);
+ pg_conveyor_init 
+------------------
+ 
+(1 row)
+
+SELECT pg_conveyor_insert('test'::regclass::oid, 'test_data');
+ pg_conveyor_insert 
+--------------------
+ 
+(1 row)
+
+SELECT pg_conveyor_read('test'::regclass::oid, 0);
+ pg_conveyor_read 
+------------------
+ test_data
+(1 row)
+
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..1000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+-- read from some random blocks
+SELECT pg_conveyor_read('test'::regclass::oid, 100);
+               pg_conveyor_read                
+-----------------------------------------------
+ test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa100
+(1 row)
+
+SELECT pg_conveyor_read('test'::regclass::oid, 800);
+               pg_conveyor_read                
+-----------------------------------------------
+ test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa800
+(1 row)
+
+-- insert large number of blocks
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..5000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i+1000;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+ERROR:  should not need to extend by more than 4 blocks to reach block 66573, but have only 4097 blocks
+CONTEXT:  SQL statement "SELECT pg_conveyor_insert('test'::regclass::oid, data)"
+PL/pgSQL function inline_code_block line 9 at PERFORM
+SELECT pg_conveyor_read('test'::regclass::oid, 4000);
+                pg_conveyor_read                
+------------------------------------------------
+ test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4000
+(1 row)
+
