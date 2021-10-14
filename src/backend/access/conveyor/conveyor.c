@@ -948,7 +948,7 @@ ConveyorBeltExtend(ConveyorBelt *cb, BlockNumber blkno,
 	if (blkno < nblocks)
 	{
 		*possibly_not_on_disk_blkno = nblocks;
-		UnlockRelationForExtension(cb->cb_rel, cb->cb_fork);
+		UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
 		return ReadBufferExtended(cb->cb_rel, cb->cb_fork, blkno, RBM_NORMAL, NULL);
 	}
 
@@ -980,7 +980,7 @@ ConveyorBeltExtend(ConveyorBelt *cb, BlockNumber blkno,
 	Assert(BufferGetBlockNumber(buffer) == blkno);
 
 	/* Done extending relation. */
-	UnlockRelationForExtension(cb->cb_rel, cb->cb_fork);
+	UnlockRelationForExtension(cb->cb_rel, ExclusiveLock);
 
 	/* Remember that the relation is now longer than it used to be. */
 	*possibly_not_on_disk_blkno = blkno + 1;
