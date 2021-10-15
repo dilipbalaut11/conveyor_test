@@ -44,8 +44,7 @@ extern void cb_insert_payload_page(RelFileNode *rnode,
 								   Buffer metabuffer,
 								   BlockNumber payloadblock,
 								   Buffer payloadbuffer,
-								   bool needs_xlog,
-								   bool page_std);
+								   bool needs_xlog);
 
 extern void cb_allocate_payload_segment(RelFileNode *rnode,
 										ForkNumber fork,

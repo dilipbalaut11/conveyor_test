@@ -30,6 +30,7 @@ static CBSegNo ConveyorSearchFSMPages(ConveyorBelt *cb,
 static Buffer ConveyorBeltExtend(ConveyorBelt *cb, BlockNumber blkno,
 								 BlockNumber *possibly_not_on_disk_blkno);
 static Buffer ConveyorBeltRead(ConveyorBelt *cb, BlockNumber blkno, int mode);
+static Buffer ConveyorBeltPageIsUnused(Page page);
 
 /*
  * Handle used to mediate access to a conveyor belt.
@@ -137,7 +138,7 @@ ConveyorBeltOpen(Relation rel, ForkNumber fork, MemoryContext mcxt)
  * page = BufferGetPage(buffer);
  * START_CRIT_SECTION();
  * // set page contents
- * ConveyorBeltPerformInsert(cb, buffer, page_std);
+ * ConveyorBeltPerformInsert(cb, buffer);
  * END_CRIT_SECTION();
  * ConveyorBeltCleanupInsert(cb, buffer);
  *
@@ -147,6 +148,11 @@ ConveyorBeltOpen(Relation rel, ForkNumber fork, MemoryContext mcxt)
  * completely unsafe to do anything complicated like SearchSysCacheN. Doing
  * so could result in undetected deadlock on the buffer LWLocks, or cause
  * a relcache flush that would break ConveyorBeltPerformInsert().
+ *
+ * Also note that the "set page contents" step must put some data in the
+ * page, so that either pd_lower is greater than the minimum value
+ * (SizeOfPageHeaderData) or pd_upper is less than the maximum value
+ * (BLCKSZ).
  *
  * In future, we might want to provide the caller with an alternative to
  * calling ConveyorBeltPerformInsert, because that just logs an FPI for
@@ -488,11 +494,11 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 					ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_EXCLUSIVE);
 
 			/*
-			 * If the target buffer is still new, we're done. Otherwise,
+			 * If the target buffer is still unused, we're done. Otherwise,
 			 * someone else grabbed that page before we did, so we must fall
 			 * through and retry.
 			 */
-			if (PageIsNew(BufferGetPage(buffer)))
+			if (ConveyorBeltPageIsUnused(BufferGetPage(buffer)))
 			{
 				/*
 				 * Remember things that we'll need to know when the caller
@@ -624,7 +630,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
  * See ConveyorBeltGetNewPage for the intended usage of this fucntion.
  */
 void
-ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer, bool page_std)
+ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer)
 {
 	bool		needs_xlog;
 
@@ -643,6 +649,16 @@ ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer, bool page_std)
 				 cb->cb_insert_buffer, buffer);
 	}
 
+	/*
+	 * ConveyorBeltPageIsUnused is used by ConveyorBeltGetNewPage to figure
+	 * out whether a concurrent inserter got there first. Here, we're the
+	 * concurrent inserter, and must have initialized the page in a way that
+	 * makes that function return false for the newly-inserted page, so that
+	 * other backends can tell we got here first.
+	 */
+	if (ConveyorBeltPageIsUnused(BufferGetPage(buffer)))
+		elog(ERROR, "can't insert an unused page");
+
 	/* Caller should be doing this inside a critical section. */
 	Assert(CritSectionCount > 0);
 
@@ -657,7 +673,7 @@ ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer, bool page_std)
 	cb_insert_payload_page(cb->cb_insert_relfilenode, cb->cb_fork,
 						   cb->cb_insert_metabuffer,
 						   cb->cb_insert_block, buffer,
-						   needs_xlog, page_std);
+						   needs_xlog);
 
 	/*
 	 * Buffer locks will be released by ConveyorBeltCleanupInsert, but we can
@@ -1062,6 +1078,21 @@ ConveyorBeltRead(ConveyorBelt *cb, BlockNumber blkno, int mode)
 								RBM_NORMAL, NULL);
 	LockBuffer(buffer, mode);
 	return buffer;
+}
+
+/*
+ * We consider a page unused if it's either new (i.e. all zeroes) or if
+ * neither pd_lower nor pd_upper have moved.
+ */
+static Buffer
+ConveyorBeltPageIsUnused(Page page)
+{
+	PageHeader	ph = (PageHeader) page;
+
+	if (PageIsNew(page))
+		return true;
+
+	return (ph->pd_lower <= SizeOfPageHeaderData && ph->pd_upper == BLCKSZ);
 }
 
 /*

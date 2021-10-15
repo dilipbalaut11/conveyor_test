@@ -98,7 +98,7 @@ cb_create_fsmpage(RelFileNode *rnode,
 void
 cb_insert_payload_page(RelFileNode *rnode, ForkNumber fork, Buffer metabuffer,
 					   BlockNumber payloadblock, Buffer payloadbuffer,
-					   bool needs_xlog, bool page_std)
+					   bool needs_xlog)
 {
 	Page		metapage;
 	Page		payloadpage;
@@ -117,16 +117,12 @@ cb_insert_payload_page(RelFileNode *rnode, ForkNumber fork, Buffer metabuffer,
 	if (needs_xlog)
 	{
 		XLogRecPtr	lsn;
-		int			flags = REGBUF_FORCE_IMAGE;
-
-		if (page_std)
-			flags |= REGBUF_STANDARD;
 
 		XLogBeginInsert();
 		XLogRegisterBlock(0, rnode, fork, CONVEYOR_METAPAGE, metapage,
 						  REGBUF_STANDARD);
 		XLogRegisterBlock(1, rnode, fork, payloadblock,
-						  payloadpage, flags);
+						  payloadpage, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 		lsn = XLogInsert(RM_CONVEYOR_ID,
 						 XLOG_CONVEYOR_INSERT_PAYLOAD_PAGE);
 

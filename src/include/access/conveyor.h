@@ -34,8 +34,7 @@ extern ConveyorBelt *ConveyorBeltOpen(Relation rel,
 
 /* Routines to inserting new data into a conveyor belt. */
 extern Buffer ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno);
-extern void ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer,
-									  bool page_std);
+extern void ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer);
 extern void ConveyorBeltCleanupInsert(ConveyorBelt *cb, Buffer buffer);
 
 /* Routines for reading data from a conveyor belt. */

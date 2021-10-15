@@ -22,10 +22,10 @@ allocated to them can be reused for new logical pages.
 Conceptually, a relation fork organized as a conveyor belt has three parts:
 
 - Payload. The payload is whatever data the user of this module wishes
-  to store. The conveyor belt system avoids making any assumptions about how
-  payload pages are used, with one exception: it's expected that after
-  a payload page is initialized, PageIsNew() will return false. Apart from
-  that, this module doesn't know or care about their contents.
+  to store. The conveyor belt doesn't care what you store in a payload page,
+  but it does require that you store something: each time a payload page is
+  initialized, it must end up with either pd_lower > SizeOfPageHeaderData,
+  or pd_lower < BLCKSZ.
 
 - Index. The index translates logical page numbers to physical block
   numbers.  The intention is that pages might be physically relocated - e.g.
