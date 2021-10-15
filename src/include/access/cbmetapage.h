@@ -85,6 +85,33 @@ typedef enum
 } CBMInsertState;
 
 /*
+ * Possible states of the metapage with regard to obsoleting index entries.
+ *
+ * CBM_OBSOLETE_SEGMENT_ENTRIES means that there may be index entries which
+ * are no longer required in the oldest index segment.
+ *
+ * CBM_OBSOLETE_METAPAGE_ENTRIES means that there are no index segments in
+ * existence and that there is at least one index entry in the metapage
+ * that is no longer required.
+ *
+ * CBM_OBSOLETE_METAPAGE_START means that there are no index segments in
+ * in existence and that all index entries in the metapage prior to the
+ * logical truncation point have been cleared; however, the metapage's
+ * notion of where the index begins should be advanced to free up space
+ * in the metapage.
+ *
+ * CBM_OBSOLETE_NOTHING means that there is no cleanup work of this type
+ * to be done.
+ */
+typedef enum
+{
+	CBM_OBSOLETE_SEGMENT_ENTRIES,
+	CBM_OBSOLETE_METAPAGE_ENTRIES,
+	CBM_OBSOLETE_METAPAGE_START,
+	CBM_OBSOLETE_NOTHING
+} CBMObsoleteState;
+
+/*
  * Function prototypes.
  */
 extern void cb_metapage_initialize(Page page, uint16 pages_per_segment);
@@ -124,10 +151,19 @@ extern void cb_metapage_get_index_info(CBMetapageData *meta,
 									   CBSegNo *oldest_index_segment,
 									   CBSegNo *newest_index_segment,
 									   uint64 *index_segments_moved);
+
 extern void cb_metapage_add_index_segment(CBMetapageData *meta,
 										  CBSegNo segno);
 extern void cb_metapage_remove_index_segment(CBMetapageData *meta,
 											 CBSegNo segno);
+extern CBMObsoleteState cb_metapage_get_obsolete_state(CBMetapageData *meta,
+													   CBSegNo *oldest_index_segment,
+													   CBSegNo *metapage_segno,
+													   unsigned *metapage_offset);
+extern void cb_metapage_clear_obsolete_index_entry(CBMetapageData *meta,
+												   CBSegNo segno,
+												   unsigned offset);
+
 extern CBSegNo cb_metapage_find_free_segment(CBMetapageData *meta);
 extern bool cb_metapage_get_fsm_bit(CBMetapageData *meta, CBSegNo segno);
 extern void cb_metapage_set_fsm_bit(CBMetapageData *meta, CBSegNo segno,

@@ -484,6 +484,129 @@ cb_metapage_remove_index_segment(CBMetapageData *meta, CBSegNo segno)
 }
 
 /*
+ * Examine the metapage state to determine how to go about recycling space.
+ *
+ * If the return value is CBM_OBSOLETE_SEGMENT_ENTRIES, then
+ * *oldest_index_segment will be set, and the caller should remove obsolete
+ * entries from that segment and/or the segment itself.
+ *
+ * If the return value is CBM_OBSOLETE_METAPAGE_ENTRIES, then *metapage_segno
+ * will be set to a payload segment that can be deallocated, and
+ * *metapage_offset to the location in the metapage where the index entry
+ * referencing that segment is stored.
+ *
+ * If the return value is CBM_OBSOLETE_METAPAGE_START, then there are
+ * no index segments and no uncleared index entries in the metapage that
+ * are obsolete, but some cleared index entries can be discarded.
+ *
+ * If the return value is CBM_OBSOLETE_NOTHING, there's nothing to do.
+ */
+CBMObsoleteState
+cb_metapage_get_obsolete_state(CBMetapageData *meta,
+							   CBSegNo *oldest_index_segment,
+							   CBSegNo *metapage_segno,
+							   unsigned *metapage_offset)
+{
+	CBPageNo	istart = meta->cbm_index_start;
+	CBPageNo	imstart = meta->cbm_index_metapage_start;
+	CBPageNo	olpage = meta->cbm_oldest_logical_page;
+	uint16		pps = meta->cbm_pages_per_segment;
+	unsigned	keep_offset;
+	unsigned	offset;
+
+	/* Sanity checks. */
+	if (olpage < istart)
+		elog(ERROR,
+			 "index starts at " UINT64_FORMAT " but oldest logical page is " UINT64_FORMAT,
+			istart, olpage);
+	if (imstart < istart)
+		elog(ERROR,
+			 "metapage index starts at " UINT64_FORMAT " but index starts at " UINT64_FORMAT,
+			imstart, istart);
+	if (istart % pps != 0)
+		elog(ERROR,
+			 "index start " UINT64_FORMAT " is not a multiple of pages per segment",
+			 istart);
+	if (imstart % pps != 0)
+		elog(ERROR,
+			 "index metapage start " UINT64_FORMAT " is not a multiple of pages per segment",
+			 imstart);
+
+	/*
+	 * Detect the case where there is no obsolete data in the index.
+	 *
+	 * This happens if the oldest logical page is either equal to the start
+	 * of the index, or follows it by less than the number of pages per
+	 * segment. In the latter case, some but not all of the pages in the
+	 * oldest payload segment are obsolete. We can only clean up entire
+	 * payload semgents, so in such cases there is nothing to do.
+	 */
+	if (istart + pps > olpage)
+		return CBM_OBSOLETE_NOTHING;
+
+	/*
+	 * If there are any index segments, then the first step is to remove
+	 * index entries from those segments, and the second step is to remove
+	 * the segments themselves if they end up containing no useful entries.
+	 * We need not consider doing anything in the metapage itself until no
+	 * index segments remain.
+	 */
+	if (meta->cbm_oldest_index_segment != CB_INVALID_SEGMENT)
+	{
+		*oldest_index_segment = meta->cbm_oldest_index_segment;
+		return CBM_OBSOLETE_SEGMENT_ENTRIES;
+	}
+
+	/*
+	 * Since there are no index pages, the whole index is in the metapage,
+	 * and therefore the logical page number should be somewhere in the range
+	 * of pages covered by the metapage.
+	 */
+	if (olpage < imstart)
+		elog(ERROR,
+			 "oldest logical page " UINT64_FORMAT " precedes metapage start " UINT64_FORMAT " but there are no index segments",
+			 olpage, imstart);
+
+	/* Search for obsolete index entries that have not yet been cleared. */
+	keep_offset = (olpage - imstart) / pps;
+	for (offset = 0; offset < keep_offset; ++offset)
+	{
+		if (meta->cbm_index[offset] != CB_INVALID_SEGMENT)
+		{
+			*metapage_segno = meta->cbm_index[offset];
+			*metapage_offset = offset;
+			return CBM_OBSOLETE_METAPAGE_ENTRIES;
+		}
+	}
+
+	/*
+	 * Apparently, there's nothing left to do but discard already-cleared
+	 * index entries.
+	 */
+	return CBM_OBSOLETE_METAPAGE_START;
+}
+
+/*
+ * Clear a single index entry from the metapage.
+ *
+ * We require that the caller provide not only the offset but the segment
+ * number that is expected to be found at that offset. That lets us check
+ * that nothing unexpected has occurred.
+ */
+void
+cb_metapage_clear_obsolete_index_entry(CBMetapageData *meta,
+									   CBSegNo segno,
+									   unsigned offset)
+{
+	if (meta->cbm_index[offset] != offset)
+		elog(ERROR,
+			 "index entry at offset %u was expected to be %u but found %u",
+			 offset, segno, meta->cbm_index[offset]);
+
+	meta->cbm_index[offset] = CB_INVALID_SEGMENT;
+}
+
+/*
  * Returns the lowest unused segment number covered by the metapage,
  * or CB_INVALID_SEGMENT if none.
  */
