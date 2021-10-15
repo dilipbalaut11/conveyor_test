@@ -909,7 +909,7 @@ ConveyorBeltGetBounds(ConveyorBelt *cb, CBPageNo *oldest_logical_page,
  * created on disk before allocating the segment which follows, so the same
  * rule applies.
  */
-Buffer
+static Buffer
 ConveyorBeltExtend(ConveyorBelt *cb, BlockNumber blkno,
 				   BlockNumber *possibly_not_on_disk_blkno)
 {
