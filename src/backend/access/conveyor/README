@@ -98,9 +98,13 @@ Removing Old Data
 -----------------
 
 From time to time, we expect to receive a request to discard old data,
-which will come in the form of a statement that all logical pages with
-page numbers less than some threshold value are no longer required. We
-proceed as follows:
+which will come in the form of a call to ConveyorBeltLogicalTruncate stating
+that all logical pages with page numbers less than some threshold value are
+no longer required. Thereafter, a subsequent call to ConveyorBeltVacuum
+may be used to free up any segments that are no longer required as a result
+of the increased logical truncation point. The overall process looks like
+this, with the first step being performed by ConveyorBeltLogicalTruncate
+and the remaining steps by ConveyorBeltVacuum:
 
 1. Update the metapage with the new threshold value. Once this has been
    done, attempts to access logical pages prior to the new threshold will
