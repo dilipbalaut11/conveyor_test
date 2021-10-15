@@ -40,8 +40,10 @@ extern Buffer ConveyorBeltReadBuffer(ConveyorBelt *cb, CBPageNo pageno,
 extern void ConveyorBeltGetBounds(ConveyorBelt *cb,
 								  CBPageNo *oldest_logical_page,
 								  CBPageNo *next_logical_page);
-extern void ConveyorBeltTruncate(ConveyorBelt *cb, CBPageNo oldest_keeper);
+extern void ConveyorBeltLogicalTruncate(ConveyorBelt *cb,
+										CBPageNo oldest_keeper);
 extern void ConveyorBeltVacuum(ConveyorBelt *cb);
+extern void ConveyorBeltPhysicalTruncate(ConveyorBelt *cb);
 extern void ConveyorBeltCompact(ConveyorBelt *cb);
 extern ConveyorBelt *ConveyorBeltRewrite(ConveyorBelt *cb,
 										 Relation rel,

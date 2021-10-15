@@ -218,7 +218,6 @@ cb_xlog_relocate_index_entries(XLogReaderState *record)
 
 	xlrec = (xl_cb_relocate_index_entries *) XLogRecGetData(record);
 
-	/* NB: metapage must be last due to lock ordering rules */
 	if (XLogReadBufferForRedo(record, 1, &indexbuffer) == BLK_NEEDS_REDO)
 	{
 		Page	indexpage = BufferGetPage(indexbuffer);
@@ -252,6 +251,33 @@ cb_xlog_relocate_index_entries(XLogReaderState *record)
 }
 
 /*
+ * REDO function for cb_logical_truncate.
+ */
+static void
+cb_xlog_logical_truncate(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_cb_logical_truncate *xlrec;
+	Buffer		metabuffer;
+
+	xlrec = (xl_cb_logical_truncate *) XLogRecGetData(record);
+
+	if (XLogReadBufferForRedo(record, 0, &metabuffer) == BLK_NEEDS_REDO)
+	{
+		Page	metapage = BufferGetPage(metabuffer);
+		CBMetapageData *meta;
+
+		meta = cb_metapage_get_special(metapage);
+		cb_metapage_advance_oldest_logical_page(meta, xlrec->oldest_keeper);
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
+
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
+}
+
+/*
  * Main entrypoint for conveyor belt REDO.
  */
 void
@@ -275,6 +301,9 @@ conveyor_redo(XLogReaderState *record)
 			break;
 		case XLOG_CONVEYOR_RELOCATE_INDEX_ENTRIES:
 			cb_xlog_relocate_index_entries(record);
+			break;
+		case XLOG_CONVEYOR_LOGICAL_TRUNCATE:
+			cb_xlog_logical_truncate(record);
 			break;
 		default:
 			elog(PANIC, "conveyor_redo: unknown op code %u", info);

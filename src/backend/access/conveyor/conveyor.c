@@ -892,6 +892,67 @@ ConveyorBeltGetBounds(ConveyorBelt *cb, CBPageNo *oldest_logical_page,
 }
 
 /*
+ * Update the conveyor belt's notion of the oldest logical page to be kept.
+ *
+ * This doesn't physically shrink the relation, nor does it even make space
+ * available for reuse by future insertions. It just makes pages prior to
+ * 'oldest_keeper' unavailable, thus potentially allowing the segments
+ * containing those pages to be freed by a future call to ConveyorBeltVacuum.
+ *
+ * A call to this function shouldn't try to move the logical truncation point
+ * backwards. That is, the value of 'oldest_keeper' should always be greater
+ * than or equal to the value passed on the previous call for this conveyor
+ * belt. It also shouldn't try to move the logical truncation point beyond
+ * the current insertion point: don't try to throw away data that hasn't been
+ * inserted yet!
+ *
+ * For routine cleanup of a conveyor belt, the recommended sequence of calls
+ * is ConveyorBeltLogicalTruncate then ConveyorBeltVacuum then
+ * ConveyorBeltPhysicalTruncate. For more aggressive cleanup options, see
+ * ConveyorBeltCompact or ConveyorBeltRewrite.
+ */
+void
+ConveyorBeltLogicalTruncate(ConveyorBelt *cb, CBPageNo oldest_keeper)
+{
+	Buffer		metabuffer;
+	CBMetapageData *meta;
+	CBPageNo	oldest_logical_page;
+	CBPageNo	next_logical_page;
+	RelFileNode *rnode;
+	bool		needs_xlog;
+
+	/*
+	 * We must take a cleanup lock to adjust the logical truncation point,
+	 * as per the locking protocols in src/backend/access/conveyor/README.
+	 */
+	metabuffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork, CONVEYOR_METAPAGE,
+									RBM_NORMAL, NULL);
+	LockBufferForCleanup(metabuffer);
+
+	/* Sanity checks. */
+	meta = cb_metapage_get_special(BufferGetPage(metabuffer));
+	cb_metapage_get_bounds(meta, &oldest_logical_page, &next_logical_page);
+	if (oldest_keeper < oldest_logical_page)
+		elog(ERROR,
+			 "can't move truncation point backwards from " UINT64_FORMAT " to " UINT64_FORMAT,
+			 oldest_logical_page, oldest_keeper);
+	if (oldest_keeper > next_logical_page)
+		elog(ERROR,
+			 "can't move truncation point to " UINT64_FORMAT " beyond insert point " UINT64_FORMAT,
+			 oldest_keeper, next_logical_page);
+
+
+	/* Do the real work. */
+	rnode = &RelationGetSmgr(cb->cb_rel)->smgr_rnode.node;
+	needs_xlog = RelationNeedsWAL(cb->cb_rel) || cb->cb_fork == INIT_FORKNUM;
+	cb_logical_truncate(rnode, cb->cb_fork, metabuffer, oldest_keeper,
+						needs_xlog);
+
+	/* Release buffer lock. */
+	UnlockReleaseBuffer(metabuffer);
+}
+
+/*
  * Pin and return the block indicated by 'blkno', extending if needed.
  *
  * On entry, *possibly_not_on_disk_blkno should be the smallest block number

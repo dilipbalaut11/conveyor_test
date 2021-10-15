@@ -440,3 +440,44 @@ cb_relocate_index_entries(RelFileNode *rnode,
 
 	END_CRIT_SECTION();
 }
+
+/*
+ * Logically truncate a conveyor belt by updating its notion of the oldest
+ * logical page.
+ */
+void
+cb_logical_truncate(RelFileNode *rnode,
+					ForkNumber fork,
+					Buffer metabuffer,
+					CBPageNo oldest_keeper,
+					bool needs_xlog)
+{
+	Page		metapage;
+	CBMetapageData *meta;
+
+	metapage = BufferGetPage(metabuffer);
+	meta = cb_metapage_get_special(metapage);
+
+	START_CRIT_SECTION();
+
+	cb_metapage_advance_oldest_logical_page(meta, oldest_keeper);
+
+	if (needs_xlog)
+	{
+		xl_cb_logical_truncate	xlrec;
+		XLogRecPtr	lsn;
+
+		xlrec.oldest_keeper = oldest_keeper;
+
+		XLogBeginInsert();
+		XLogRegisterBlock(0, rnode, fork, CONVEYOR_METAPAGE, metapage,
+						  REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec, SizeOfCBLogicalTruncate);
+		lsn = XLogInsert(RM_CONVEYOR_ID,
+						 XLOG_CONVEYOR_LOGICAL_TRUNCATE);
+
+		PageSetLSN(metapage, lsn);
+	}
+
+	END_CRIT_SECTION();
+}

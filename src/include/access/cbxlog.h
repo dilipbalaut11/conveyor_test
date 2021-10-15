@@ -24,6 +24,7 @@
 #define	XLOG_CONVEYOR_ALLOCATE_INDEX_SEGMENT		0x30
 #define	XLOG_CONVEYOR_ALLOCATE_INDEX_PAGE			0x40
 #define XLOG_CONVEYOR_RELOCATE_INDEX_ENTRIES		0x50
+#define XLOG_CONVEYOR_LOGICAL_TRUNCATE				0x60
 
 typedef struct xl_cb_allocate_payload_segment
 {
@@ -62,6 +63,14 @@ typedef struct xl_cb_relocate_index_entries
 
 #define SizeOfCBRelocateIndexEntries \
 	(offsetof(xl_cb_relocate_index_entries, index_entries))
+
+typedef struct xl_cb_logical_truncate
+{
+	CBPageNo	oldest_keeper;
+} xl_cb_logical_truncate;
+
+#define SizeOfCBLogicalTruncate \
+	(offsetof(xl_cb_logical_truncate, oldest_keeper) + sizeof(CBPageNo))
 
 extern void conveyor_desc(StringInfo buf, XLogReaderState *record);
 extern void conveyor_redo(XLogReaderState *record);

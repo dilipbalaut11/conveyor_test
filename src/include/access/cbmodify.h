@@ -88,4 +88,10 @@ extern void cb_relocate_index_entries(RelFileNode *rnode,
 									  CBPageNo index_page_start,
 									  bool needs_xlog);
 
+extern void cb_logical_truncate(RelFileNode *rnode,
+								ForkNumber fork,
+								Buffer metabuffer,
+								CBPageNo oldest_keeper,
+								bool needs_xlog);
+
 #endif							/* CBMODIFY_H */
