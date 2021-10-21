@@ -107,6 +107,8 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	bool		full = false;
 	bool		disable_page_skipping = false;
 	bool		process_toast = true;
+	bool		first_pass = false;
+	bool		second_pass = false;
 	ListCell   *lc;
 
 	/* index_cleanup and truncate values unspecified for now */
@@ -193,6 +195,10 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 					params.nworkers = nworkers;
 			}
 		}
+		else if (strcmp(opt->defname, "first_pass") == 0)
+			first_pass = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "second_pass") == 0)
+			second_pass = defGetBoolean(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -209,7 +215,9 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 		(freeze ? VACOPT_FREEZE : 0) |
 		(full ? VACOPT_FULL : 0) |
 		(disable_page_skipping ? VACOPT_DISABLE_PAGE_SKIPPING : 0) |
-		(process_toast ? VACOPT_PROCESS_TOAST : 0);
+		(process_toast ? VACOPT_PROCESS_TOAST : 0) |
+		(first_pass ? VACOPT_FIRST_PASS : 0) |
+		(second_pass ? VACOPT_SECOND_PASS : 0);
 
 	/* sanity checks on options */
 	Assert(params.options & (VACOPT_VACUUM | VACOPT_ANALYZE));
@@ -300,6 +308,11 @@ vacuum(List *relations, VacuumParams *params,
 	Assert(params != NULL);
 
 	stmttype = (params->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
+
+	if (params->options & VACOPT_FIRST_PASS)
+		elog(WARNING, "***FIRST PASS VACUUM****");
+	else if (params->options & VACOPT_SECOND_PASS)
+		elog(WARNING, "***SECOND PASS VACUUM****");
 
 	/*
 	 * We cannot run VACUUM inside a user transaction block; if we were inside
@@ -1887,6 +1900,15 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 								  rel->rd_rel,
 								  params->options & VACOPT_VACUUM))
 	{
+		relation_close(rel, lmode);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return false;
+	}
+
+	if (rel->rd_rel->relkind == RELKIND_INDEX)
+	{
+		elog(WARNING, "VACUUMING INDEX");
 		relation_close(rel, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();

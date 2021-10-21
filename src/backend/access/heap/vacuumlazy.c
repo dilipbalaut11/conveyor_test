@@ -874,6 +874,13 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	}
 }
 
+static void
+vacuum_store_deadtid(LVRelState *vacrel)
+{
+	elog(WARNING, "STORING DEAD TID");
+	return;
+}
+
 /*
  *	lazy_scan_heap() -- scan an open heap relation
  *
@@ -1187,7 +1194,16 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 
 			/* Remove the collected garbage tuples from table and indexes */
 			vacrel->consider_bypass_optimization = false;
-			lazy_vacuum(vacrel);
+
+			/*
+			 * If only first pass is enable then don't perform the final vacuum
+			 * cycle, instead just store the dead TID in the conveyor belt.  This
+			 * storage can be used by other vacuum cycle.
+			 */
+			if (params->options & VACOPT_FIRST_PASS)
+				vacuum_store_deadtid(vacrel);
+			else
+				lazy_vacuum(vacrel);
 
 			/*
 			 * Vacuum the Free Space Map to make newly-freed space visible on
@@ -1599,7 +1615,17 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 
 	/* If any tuples need to be deleted, perform final vacuum cycle */
 	if (dead_tuples->num_tuples > 0)
-		lazy_vacuum(vacrel);
+	{
+		/*
+		 * If only first pass is enable then don't perform the final vacuum
+		 * cycle, instead just store the dead TID in the conveyor belt.  This
+		 * storage can be used by other vacuum cycle.
+		 */
+		if (params->options & VACOPT_FIRST_PASS)
+			vacuum_store_deadtid(vacrel);
+		else
+			lazy_vacuum(vacrel);
+	}
 
 	/*
 	 * Vacuum the remainder of the Free Space Map.  We must do this whether or
