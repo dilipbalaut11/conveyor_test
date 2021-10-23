@@ -51,6 +51,7 @@
 #include <math.h>
 
 #include "access/amapi.h"
+#include "access/deadtidstore.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heapam_xlog.h"
@@ -874,13 +875,6 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	}
 }
 
-static void
-vacuum_store_deadtid(LVRelState *vacrel)
-{
-	elog(WARNING, "STORING DEAD TID");
-	return;
-}
-
 /*
  *	lazy_scan_heap() -- scan an open heap relation
  *
@@ -1201,7 +1195,8 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 			 * storage can be used by other vacuum cycle.
 			 */
 			if (params->options & VACOPT_FIRST_PASS)
-				vacuum_store_deadtid(vacrel);
+				DTS_AppendTid(vacrel->rel, vacrel->dead_tuples->num_tuples,
+							  vacrel->dead_tuples->itemptrs);
 			else
 				lazy_vacuum(vacrel);
 
@@ -1622,7 +1617,8 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 		 * storage can be used by other vacuum cycle.
 		 */
 		if (params->options & VACOPT_FIRST_PASS)
-			vacuum_store_deadtid(vacrel);
+			DTS_AppendTid(vacrel->rel, vacrel->dead_tuples->num_tuples,
+						  vacrel->dead_tuples->itemptrs);
 		else
 			lazy_vacuum(vacrel);
 	}
