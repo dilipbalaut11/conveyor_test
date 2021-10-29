@@ -1908,8 +1908,15 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 
 	if (rel->rd_rel->relkind == RELKIND_INDEX)
 	{
+		Relation	heapRel;
+
 		elog(WARNING, "VACUUMING INDEX");
+		heapRel = table_open(rel->rd_index->indrelid, lmode);
+
+		lazy_vacuum_index(heapRel, rel, vac_strategy);
+
 		relation_close(rel, lmode);
+		relation_close(heapRel, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return false;

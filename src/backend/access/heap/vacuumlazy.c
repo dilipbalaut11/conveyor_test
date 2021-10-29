@@ -63,6 +63,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "catalog/index.h"
+#include "catalog/indexing.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
@@ -80,6 +81,8 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 
@@ -411,7 +414,7 @@ static void lazy_scan_prune(LVRelState *vacrel, Buffer buf,
 							LVPagePruneState *prunestate);
 static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
-static void lazy_vacuum_heap_rel(LVRelState *vacrel);
+static void lazy_vacuum_heap_rel(LVRelState *vacrel, bool second_pass_only);
 static int	lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
 								  Buffer buffer, int tupindex, Buffer *vmbuffer);
 static bool lazy_check_needs_freeze(Buffer buf, bool *hastup,
@@ -469,7 +472,8 @@ static void update_vacuum_error_info(LVRelState *vacrel,
 									 OffsetNumber offnum);
 static void restore_vacuum_error_info(LVRelState *vacrel,
 									  const LVSavedErrInfo *saved_vacrel);
-
+static void lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params);
+static void UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno);
 
 /*
  *	heap_vacuum_rel() -- perform VACUUM for one heap relation
@@ -634,7 +638,10 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	error_context_stack = &errcallback;
 
 	/* Do the vacuuming */
-	lazy_scan_heap(vacrel, params, aggressive);
+	if (params->options & VACOPT_SECOND_PASS)
+		lazy_vacuum_heap(vacrel, params);
+	else
+		lazy_scan_heap(vacrel, params, aggressive);
 
 	/* Done with indexes */
 	vac_close_indexes(vacrel->nindexes, vacrel->indrels, NoLock);
@@ -699,8 +706,19 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	if (new_rel_allvisible > new_rel_pages)
 		new_rel_allvisible = new_rel_pages;
 
-	new_frozen_xid = scanned_all_unfrozen ? FreezeLimit : InvalidTransactionId;
-	new_min_multi = scanned_all_unfrozen ? MultiXactCutoff : InvalidMultiXactId;
+	/*
+	 * FIXME:
+	 */
+	if (params->options & VACOPT_SECOND_PASS)
+	{
+		new_frozen_xid = InvalidTransactionId;
+		new_min_multi = InvalidMultiXactId;
+	}
+	else
+	{
+		new_frozen_xid = scanned_all_unfrozen ? FreezeLimit : InvalidTransactionId;
+		new_min_multi = scanned_all_unfrozen ? MultiXactCutoff : InvalidMultiXactId;
+	}
 
 	vac_update_relstats(rel,
 						new_rel_pages,
@@ -866,13 +884,16 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	}
 
 	/* Cleanup index statistics and index names */
-	for (int i = 0; i < vacrel->nindexes; i++)
+	if ((params->options & VACOPT_SECOND_PASS) == 0)
 	{
-		if (vacrel->indstats[i])
-			pfree(vacrel->indstats[i]);
+		for (int i = 0; i < vacrel->nindexes; i++)
+		{
+			if (vacrel->indstats[i])
+				pfree(vacrel->indstats[i]);
 
-		if (indnames && indnames[i])
-			pfree(indnames[i]);
+			if (indnames && indnames[i])
+				pfree(indnames[i]);
+		}
 	}
 }
 
@@ -2189,7 +2210,7 @@ lazy_vacuum(LVRelState *vacrel)
 		 * We successfully completed a round of index vacuuming.  Do related
 		 * heap vacuuming now.
 		 */
-		lazy_vacuum_heap_rel(vacrel);
+		lazy_vacuum_heap_rel(vacrel, false);
 	}
 	else
 	{
@@ -2320,7 +2341,7 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
  * index entry removal in batches as large as possible.
  */
 static void
-lazy_vacuum_heap_rel(LVRelState *vacrel)
+lazy_vacuum_heap_rel(LVRelState *vacrel, bool second_pass_only)
 {
 	int			tupindex;
 	BlockNumber vacuumed_pages;
@@ -2330,7 +2351,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 
 	Assert(vacrel->do_index_vacuuming);
 	Assert(vacrel->do_index_cleanup);
-	Assert(vacrel->num_index_scans > 0);
+	Assert(second_pass_only || vacrel->num_index_scans > 0);
 
 	/* Report that we are now vacuuming the heap */
 	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
@@ -2385,7 +2406,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 	 * the second heap pass.  No more, no less.
 	 */
 	Assert(tupindex > 0);
-	Assert(vacrel->num_index_scans > 1 ||
+	Assert(second_pass_only || vacrel->num_index_scans > 1 ||
 		   (tupindex == vacrel->lpdead_items &&
 			vacuumed_pages == vacrel->lpdead_item_pages));
 
@@ -3076,6 +3097,206 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 }
 
 /*
+ * UpdateRelationLastVaccumPage - update conveyor belt pageno in pg_class entry
+ *
+ * Update relation's pg_class entry with the conveyor belt pageno upto which
+ * we have completed the vacuum.
+ */
+static void
+UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno)
+{
+	Relation		pgclass;
+	HeapTuple		reltup;
+
+	pgclass = table_open(RelationRelationId, RowExclusiveLock);
+
+	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(reltup))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	/* Update pg_class tuple as appropriate. */
+	((Form_pg_class) GETSTRUCT(reltup))->cbvacuumpage = pageno;
+
+	CatalogTupleUpdate(pgclass, &reltup->t_self, reltup);
+
+	/* Clean up */
+	heap_freetuple(reltup);
+	table_close(pgclass, RowExclusiveLock);
+}
+
+/*
+ *	index_vacuum() -- vacuum index relation.
+ */
+void
+lazy_vacuum_index(Relation heaprel, Relation indrel,
+				  BufferAccessStrategy strategy)
+{
+	LVDeadTuples   *dead_tuples;
+	CBPageNo		start_pageno,
+					last_pageread;
+	LVRelState		vacrel = {0};
+	IndexBulkDeleteResult *istat;
+	ErrorContextCallback errcallback;
+
+	/* Initialize vacuum rel state. */
+	lazy_init_vacrel(&vacrel, InvalidBlockNumber);
+	vacrel.bstrategy = strategy;
+
+	/*
+	 * FIXME: what should be this value, for now we need this in
+	 * lazy_space_alloc, just to check whether we have index on the relation
+	 * or not.
+	 */
+	vacrel.nindexes = 1;
+
+	vacrel.indstats = (IndexBulkDeleteResult **)
+		palloc0(vacrel.nindexes * sizeof(IndexBulkDeleteResult *));
+
+	/* Setup error callback. */
+	errcallback.callback = vacuum_error_callback;
+	errcallback.arg = &vacrel;
+	errcallback.previous = error_context_stack;
+	error_context_stack = &errcallback;
+
+	/*
+	 * We don't want to put the upper limit based on max possible tuple in the
+	 * relation, because we are directly performing the index vacuum from the
+	 * dead tuple storage.
+	 */
+	lazy_space_alloc(&vacrel, -1, InvalidBlockNumber);
+	dead_tuples = vacrel.dead_tuples;
+
+	/* Report that we are now vacuuming indexes */
+	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
+								 PROGRESS_VACUUM_PHASE_VACUUM_INDEX);
+
+	/* Get the next cbpage from where we want to start vacuum. */
+	start_pageno = indrel->rd_rel->cbvacuumpage;
+
+	/* Read dead tids from the dead tuple store. */
+	dead_tuples->num_tuples = DTS_ReadDeadTids(heaprel, start_pageno,
+											   dead_tuples->max_tuples,
+											   dead_tuples->itemptrs,
+											   &last_pageread);
+
+	/*
+	 * Loop until we complete the index vacuum.  Read tuples which can fit into
+	 * the dead_tuples area and perform the index vacuum.  Repeat this until
+	 * there is no TID in the dead tuple store.
+	 */
+	while(1)
+	{
+		/* Read dead tids from the dead tuple store. */
+		dead_tuples->num_tuples = DTS_ReadDeadTids(heaprel, start_pageno,
+												dead_tuples->max_tuples,
+												dead_tuples->itemptrs,
+												&last_pageread);
+
+		/* No more dead tuples so we are done. */
+		if (dead_tuples->num_tuples == 0)
+			break;
+
+		/* Do index vacuuming. */
+		istat = lazy_vacuum_one_index(indrel, NULL, heaprel->rd_rel->reltuples,
+									  &vacrel);
+		/* Go to the next logical page. */
+		start_pageno = last_pageread + 1;
+	}
+
+	/*
+	 * Set the conveyor belt pageno upto which we have already vacuumed so that
+	 * next time we can start vacuum from this point.
+	 */
+	UpdateRelationLastVaccumPage(RelationGetRelid(indrel), last_pageread + 1);
+
+	pgstat_progress_update_param(PROGRESS_VACUUM_NUM_INDEX_VACUUMS,
+								 vacrel.num_index_scans);
+
+	/* Update index statistics. */
+	if (istat->estimated_count)
+		vac_update_relstats(indrel,
+							istat->num_pages,
+							istat->num_index_tuples,
+							0,
+							false,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							false);
+
+	/* Cleanup */
+	lazy_space_free(&vacrel);
+}
+
+/*
+ *	heap_vacuum_rel() -- perform pass2 VACUUM for one heap relation
+ */
+static void
+lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
+{
+	CBPageNo	min_pageno = CB_INVALID_LOGICAL_PAGE;
+	CBPageNo	start_pageno;
+	CBPageNo	last_pageread;
+	int			i;
+	LVDeadTuples   *dead_tuples;
+
+	/* Initialize vacuum rel state. */
+	lazy_init_vacrel(vacrel, RelationGetNumberOfBlocks(vacrel->rel));
+
+	/*
+	 * Loop thorugh all the indexes and find out the minimum conveyor belt
+	 * pageno, upto which all the indexes have been vacuumed.
+	 */
+	for (i = 0; i < vacrel->nindexes; i++)
+	{
+		if (min_pageno == CB_INVALID_LOGICAL_PAGE ||
+			vacrel->indrels[i]->rd_rel->cbvacuumpage < min_pageno)
+			min_pageno = vacrel->indrels[i]->rd_rel->cbvacuumpage;
+	}
+
+	/*
+	 * We don't want to put the upper limit based on max possible tuple in the
+	 * relation, because we are directly performing the index vacuum from the
+	 * dead tuple storage.
+	 */
+	lazy_space_alloc(vacrel, -1, InvalidBlockNumber);
+	dead_tuples = vacrel->dead_tuples;
+
+	/* Get the next cbpage from where we want to start vacuum. */
+	start_pageno = vacrel->rel->rd_rel->cbvacuumpage;
+
+	/* Loop until we complete the heap vacuum. */
+	while(start_pageno <= min_pageno)
+	{
+		/* Read dead tids from the dead tuple store. */
+		dead_tuples->num_tuples =
+							DTS_ReadDeadTids(vacrel->rel, start_pageno,
+											 dead_tuples->max_tuples,
+											 dead_tuples->itemptrs,
+											 &last_pageread);
+
+		/* No more dead tids, we are done. */
+		if (dead_tuples->num_tuples == 0)
+			break;
+
+		/* Perform heap vacuum. */	
+		lazy_vacuum_heap_rel(vacrel, true);
+
+		/* Go to the next logical page. */
+		start_pageno = last_pageread + 1;
+	}
+
+	/*
+	 * Set the conveyor belt pageno upto which we have already vacuumed so that
+	 * next time we can start vacuum from this point.
+	 */
+	UpdateRelationLastVaccumPage(RelationGetRelid(vacrel->rel),
+								 last_pageread + 1);
+
+	/* Cleanup */
+	lazy_space_free(vacrel);
+}
+
+/*
  *	lazy_cleanup_one_index() -- do post-vacuum cleanup for index relation.
  *
  *		reltuples is the number of heap tuples and estimated_count is true
@@ -3470,7 +3691,8 @@ compute_max_dead_tuples(BlockNumber relblocks, bool hasindex)
 		maxtuples = Min(maxtuples, MAXDEADTUPLES(MaxAllocSize));
 
 		/* curious coding here to ensure the multiplication can't overflow */
-		if ((BlockNumber) (maxtuples / LAZY_ALLOC_TUPLES) > relblocks)
+		if (BlockNumberIsValid(relblocks) &&
+			(BlockNumber) (maxtuples / LAZY_ALLOC_TUPLES) > relblocks)
 			maxtuples = relblocks * LAZY_ALLOC_TUPLES;
 
 		/* stay sane if small maintenance_work_mem */
