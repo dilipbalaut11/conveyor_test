@@ -444,6 +444,7 @@ static void lazy_truncate_heap(LVRelState *vacrel);
 static BlockNumber count_nondeletable_pages(LVRelState *vacrel,
 											bool *lock_waiter_detected);
 static long compute_max_dead_tuples(BlockNumber relblocks, bool hasindex);
+static void lazy_init_vacrel(LVRelState *vacrel, BlockNumber nblocks);
 static void lazy_space_alloc(LVRelState *vacrel, int nworkers,
 							 BlockNumber relblocks);
 static void lazy_space_free(LVRelState *vacrel);
@@ -941,22 +942,9 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	next_unskippable_block = 0;
 	next_failsafe_block = 0;
 	next_fsm_block_to_vacuum = 0;
-	vacrel->rel_pages = nblocks;
-	vacrel->scanned_pages = 0;
-	vacrel->pinskipped_pages = 0;
-	vacrel->frozenskipped_pages = 0;
-	vacrel->tupcount_pages = 0;
-	vacrel->pages_removed = 0;
-	vacrel->lpdead_item_pages = 0;
-	vacrel->nonempty_pages = 0;
 
-	/* Initialize instrumentation counters */
-	vacrel->num_index_scans = 0;
-	vacrel->tuples_deleted = 0;
-	vacrel->lpdead_items = 0;
-	vacrel->new_dead_tuples = 0;
-	vacrel->num_tuples = 0;
-	vacrel->live_tuples = 0;
+	/* Initialize the vacrel */
+	lazy_init_vacrel(vacrel, nblocks);
 
 	vistest = GlobalVisTestFor(vacrel->rel);
 
@@ -3492,6 +3480,30 @@ compute_max_dead_tuples(BlockNumber relblocks, bool hasindex)
 		maxtuples = MaxHeapTuplesPerPage;
 
 	return maxtuples;
+}
+
+/*
+ * lazy_init_vacrel - initialize lazy vacuum rel state structure
+ */
+static void
+lazy_init_vacrel(LVRelState *vacrel, BlockNumber nblocks)
+{
+	vacrel->rel_pages = nblocks;
+	vacrel->scanned_pages = 0;
+	vacrel->pinskipped_pages = 0;
+	vacrel->frozenskipped_pages = 0;
+	vacrel->tupcount_pages = 0;
+	vacrel->pages_removed = 0;
+	vacrel->lpdead_item_pages = 0;
+	vacrel->nonempty_pages = 0;
+
+	/* Initialize instrumentation counters */
+	vacrel->num_index_scans = 0;
+	vacrel->tuples_deleted = 0;
+	vacrel->lpdead_items = 0;
+	vacrel->new_dead_tuples = 0;
+	vacrel->num_tuples = 0;
+	vacrel->live_tuples = 0;
 }
 
 /*
