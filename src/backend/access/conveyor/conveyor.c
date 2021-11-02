@@ -350,7 +350,8 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		 */
 		if (can_allocate_segment &&
 			insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT &&
-			(!BufferIsValid(indexbuffer) || !BufferIsValid(prevbuffer)))
+			(!BufferIsValid(indexbuffer) || (!BufferIsValid(prevbuffer)
+			&& newest_index_segment != CB_INVALID_SEGMENT)))
 			can_allocate_segment = false;
 
 		/*
@@ -416,6 +417,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				 * index entries to that index segment.
 				 */
 				insert_state = CBM_INSERT_NEEDS_INDEX_ENTRIES_RELOCATED;
+				next_blkno = indexblock;
 			}
 
 			/*
@@ -533,15 +535,17 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		}
 
 		/*
-		 * If we need to add a new index segment, we'll have to update the
-		 * newest index page with a pointer to the index page we're going to
-		 * add, so we must read and pin that page.
+		 * If we need to add a new index segment and it's not the very first
+		 * one, we'll have to update the newest index page with a pointer to
+		 * the index page we're going to add, so we must read and pin that
+		 * page.
 		 *
 		 * The names "prevblock" and "prevbuffer" are intended to signify that
 		 * what is currently the newest index segment will become the previous
 		 * segment relative to the one we're going to add.
 		 */
-		if (insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT)
+		if (insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT &&
+			newest_index_segment != CB_INVALID_SEGMENT)
 		{
 			prevblock = cb_segment_to_block(cb->cb_pages_per_segment,
 											newest_index_segment, 0);
@@ -593,7 +597,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				if (insert_state == CBM_INSERT_NEEDS_INDEX_SEGMENT)
 				{
 					indexblock = free_block;
-					indexbuffer = buffer;
+					indexbuffer = free_buffer;
 				}
 				else
 					ReleaseBuffer(free_buffer);

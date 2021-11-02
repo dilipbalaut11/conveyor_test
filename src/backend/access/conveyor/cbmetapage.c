@@ -197,7 +197,8 @@ cb_metapage_get_insert_state(CBMetapageData *meta,
 			elog(ERROR,
 				 "newest index segment listed as using %u of %u entries",
 				 entries, maxentries);
-		else if (entries == maxentries)
+		else if (entries == maxentries ||
+				 meta->cbm_newest_index_segment == CB_INVALID_SEGMENT)
 			return CBM_INSERT_NEEDS_INDEX_SEGMENT;
 		else
 		{
@@ -374,8 +375,7 @@ cb_metapage_remove_index_entries(CBMetapageData *meta, unsigned count,
 		elog(ERROR, "removed index entries should be relocated if index segments exist");
 	if (relocating &&
 		(meta->cbm_oldest_index_segment == CB_INVALID_SEGMENT ||
-		 meta->cbm_newest_index_segment == CB_INVALID_SEGMENT ||
-		 meta->cbm_index_start == meta->cbm_index_metapage_start))
+		 meta->cbm_newest_index_segment == CB_INVALID_SEGMENT))
 		elog(ERROR, "removed index entries can't be relocated if no index segments exist");
 
 	/* Move any entries that we are keeping. */
