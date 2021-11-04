@@ -384,7 +384,7 @@ cb_metapage_remove_index_entries(CBMetapageData *meta, unsigned count,
 				sizeof(CBSegNo) * (used - count));
 
 	/* Zap the entries that were formerly in use and are no longer. */
-	for (offset = count; offset < used; ++offset)
+	for (offset = used - count; offset < used; ++offset)
 		meta->cbm_index[offset] = CB_INVALID_SEGMENT;
 
 	/*

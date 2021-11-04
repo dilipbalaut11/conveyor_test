@@ -490,11 +490,6 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 										&possibly_not_on_disk_blkno);
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
-			/* If we didn't extend the relation, just read the buffer. */
-			if (!BufferIsValid(buffer))
-				buffer =
-					ConveyorBeltRead(cb, next_blkno, BUFFER_LOCK_EXCLUSIVE);
-
 			/*
 			 * If the target buffer is still unused, we're done. Otherwise,
 			 * someone else grabbed that page before we did, so we must fall
@@ -514,6 +509,9 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 				/* Success, so escape toplevel retry loop. */
 				break;
 			}
+
+			/* We'll have to retry with a different buffer. */
+			UnlockReleaseBuffer(buffer);
 		}
 
 		/*
