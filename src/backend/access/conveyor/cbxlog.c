@@ -118,20 +118,18 @@ cb_xlog_allocate_index_segment(XLogReaderState *record)
 	Buffer		indexbuffer;
 	Buffer		prevbuffer = InvalidBuffer;
 	Buffer		fsmbuffer = InvalidBuffer;
+	Page		indexpage;
 
 	have_prev_page = XLogRecGetBlockTag(record, 2, NULL, NULL, NULL);
 	have_fsm_page = XLogRecGetBlockTag(record, 3, NULL, NULL, NULL);
 
 	xlrec = (xl_cb_allocate_index_segment *) XLogRecGetData(record);
 
-	if (XLogReadBufferForRedo(record, 1, &indexbuffer) == BLK_NEEDS_REDO)
-	{
-		Page	indexpage = BufferGetPage(indexbuffer);
-
-		cb_indexpage_initialize(indexpage, xlrec->pageno);
-		PageSetLSN(indexpage, lsn);
-		MarkBufferDirty(indexbuffer);
-	}
+	indexbuffer = XLogInitBufferForRedo(record, 1);
+	indexpage = BufferGetPage(indexbuffer);
+	cb_indexpage_initialize(indexpage, xlrec->pageno);
+	PageSetLSN(indexpage, lsn);
+	MarkBufferDirty(indexbuffer);
 
 	if (have_prev_page &&
 		XLogReadBufferForRedo(record, 2, &prevbuffer) == BLK_NEEDS_REDO)
@@ -188,21 +186,17 @@ cb_xlog_allocate_index_page(XLogReaderState *record)
 	XLogRecPtr	lsn = record->EndRecPtr;
 	xl_cb_allocate_index_page *xlrec;
 	Buffer		indexbuffer;
+	Page		indexpage;
 
 	xlrec = (xl_cb_allocate_index_page *) XLogRecGetData(record);
 
-	/* NB: new index buffer should come first due to lock ordering rules */
-	if (XLogReadBufferForRedo(record, 0, &indexbuffer) == BLK_NEEDS_REDO)
-	{
-		Page	indexpage = BufferGetPage(indexbuffer);
+	indexbuffer = XLogInitBufferForRedo(record, 0);
+	indexpage = BufferGetPage(indexbuffer);
+	cb_indexpage_initialize(indexpage, xlrec->pageno);
+	PageSetLSN(indexpage, lsn);
+	MarkBufferDirty(indexbuffer);
 
-		cb_indexpage_initialize(indexpage, xlrec->pageno);
-		PageSetLSN(indexpage, lsn);
-		MarkBufferDirty(indexbuffer);
-	}
-
-	if (BufferIsValid(indexbuffer))
-		UnlockReleaseBuffer(indexbuffer);
+	UnlockReleaseBuffer(indexbuffer);
 }
 
 /*
@@ -215,10 +209,13 @@ cb_xlog_relocate_index_entries(XLogReaderState *record)
 	xl_cb_relocate_index_entries *xlrec;
 	Buffer		metabuffer;
 	Buffer		indexbuffer;
+	ReadBufferMode	mode;
 
 	xlrec = (xl_cb_relocate_index_entries *) XLogRecGetData(record);
 
-	if (XLogReadBufferForRedo(record, 1, &indexbuffer) == BLK_NEEDS_REDO)
+	mode = xlrec->pageoffset == 0 ? RBM_ZERO_AND_LOCK : RBM_NORMAL;
+	if (XLogReadBufferForRedoExtended(record, 1, mode, false,
+									  &indexbuffer) == BLK_NEEDS_REDO)
 	{
 		Page	indexpage = BufferGetPage(indexbuffer);
 
