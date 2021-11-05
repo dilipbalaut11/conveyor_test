@@ -102,53 +102,70 @@ which will come in the form of a call to ConveyorBeltLogicalTruncate stating
 that all logical pages with page numbers less than some threshold value are
 no longer required. Thereafter, a subsequent call to ConveyorBeltVacuum
 may be used to free up any segments that are no longer required as a result
-of the increased logical truncation point. The overall process looks like
-this, with the first step being performed by ConveyorBeltLogicalTruncate
-and the remaining steps by ConveyorBeltVacuum:
+of the increased logical truncation point. Finally, a call to
+ConveyorBeltPhysicalTruncate may be used to discard unused pages from the
+end of the relation.
 
-1. Update the metapage with the new threshold value. Once this has been
-   done, attempts to access logical pages prior to the new threshold will
-   be categorically refused.
+ConveyorBeltLogicalTruncate just updates the metapage with a new value for
+the oldest logical page in existence. Once this has been done, attempts to
+access logical pages prior to the new threshold will be categorically
+refused.  We require a cleanup lock on the matapage for this step.  This
+allows a reader which has determined the location of a payload page to
+release all buffer locks, retaining just a pin on the metapage, before
+reading and locking the target page. Since the page can't be logically
+truncated away while the pin on the metapage is held, it also can't be
+recycled.
 
-2. If there are now one or more payload segments that contain no accessible
-   pages, free them up. To do this, (a) clear the index entry that
-   points to that segment and (b) mark the segment as free in the freespace
-   map.
+ConveyorBeltVacuum performs a multi-step process to recycle index and
+payload segments whose contents are no longer needed:
 
-3. When all of the index entries in an index segment have been cleared,
-   the index segment itself can be freed. To do this, (a) update the
-   metapage's notion of the oldest index segment and of the logical page
-   number where the index begins, and (b) mark the segment as free in the
-   freespace map.
+1. If there are now one or more payload segments that contain no accessible
+   pages, it frees them up. To do this, it must first reinitialize each page of
+   each such segment, taking a cleanup lock on each page as it does so.
+   This guarantees that no other backend retains a pin on any such pages.
+   It should be impossible for any new locks or pins on these pages to be
+   taken at this point, because pages that have been logically truncated
+   can no longer be looked up via ConveyorBeltReadBuffer. It then clears
+   the index entry that points to the segment in question and simultaneously
+   marks it free in the freespace map.
 
-4. If index entries are cleared in the metapage itself, then any
+2. When all of the index entries in an index segment have been cleared,
+   the index segment itself can be freed. To do this, we first reinitialize
+   all the pages, and then update the metapage. The metapage update involves
+   changing metapage's notion of the oldest index segment and of the
+   logical page number where the index begins. Simultaneously, the segment
+   must be marked as free in the freespace map.
+
+   These metapage updates must be performed with a cleanup lock on the
+   metapage.  This allows a concurrent reader to lock the metapage, note the
+   location of the first index segment, release the lock on the metapage while
+   retaining the pin, and then go lock the pages in that index segment, or
+   successor index segments, without fearing that they will vanish.
+
+3. If index entries are cleared in the metapage itself, then any
    remaining entries can be shifted to the start of the array of index
    entries stored in the metapage, provided that we simultaneously
    adjust the metapage's notion of the logical page number where the
    index begins.
 
-Deallocating segments needs to be done with due regard for the
-possibility of concurrent readers. This means that we can't let payload
-segments or index segments disappear out from under readers who may
-still be using them. To make sure that can't happen, we require
-a cleanup lock on the metapage to perform either step (1) or step (3)
-of the procedure described above, and we require readers to hold a pin
-on the metapage until they've got a lock on whatever page they want
-to read.
+Note that there's no correctness issue if ConveyorBeltVacuum is skipped or
+if it is interrupted before all the work that it could perform actually
+gets done. It doesn't do anything that can't be deferred until a later time;
+the only problem is that you might end up with a lot of bloat. That could
+be bad, but it's not a functional breakage.
 
-Because a cleanup lock is required for step (3), a reader can lock the
-metapage, note the location of the first index segment, release the lock on
-the metapage while retaining the pin, and then go lock the pages in that
-index segment, or successor index segments, without fearing that they will
-concurrently vanish. If we didn't require a cleanup lock for step (3), a
-reader would need to keep the metapage share-locked to prevent that, which
-seems very undesirable.
+Note also that running multiple copies of ConveyorBeltVacuum on the same
+conveyor belt at the same time is a bad plan. They'll contend with each
+othr trying to do the same work. Consider preventing this by some means
+(e.g. a self-exclusive heavyweight lock).
 
-Because a cleanup lock is required for step (1), a reader which has
-determined the location of a payload page can release all buffer locks,
-retaining just a pin on the metapage, before reading and locking the
-target page. Otherwise, nothing would prevent the segment containing
-that page from being concurrently recycled.
+ConveyorBeltPhysicalTruncate can be used to return disk space to the
+operating system. This only works if the highest-numbered segments happen
+to be free, and it requires both a relation extension lock (since it would
+be bad if someone is trying to make the relation longer while we're trying
+to make it shorter) and a cleanup lock on the metapage (since
+ConveyorBeltNewPage can't cope with a concurrent truncation; it expects
+that the relation will only grow concurrently, not shrink).
 
 Buffer Lock Ordering
 --------------------

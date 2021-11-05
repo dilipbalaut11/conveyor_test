@@ -407,6 +407,9 @@ cb_relocate_index_entries(RelFileNode *rnode,
 								   index_entries);
 	cb_metapage_remove_index_entries(meta, num_index_entries, true);
 
+	MarkBufferDirty(metabuffer);
+	MarkBufferDirty(indexbuffer);
+
 	if (needs_xlog)
 	{
 		xl_cb_relocate_index_entries xlrec;
@@ -458,6 +461,8 @@ cb_logical_truncate(RelFileNode *rnode,
 
 	cb_metapage_advance_oldest_logical_page(meta, oldest_keeper);
 
+	MarkBufferDirty(metabuffer);
+
 	if (needs_xlog)
 	{
 		xl_cb_logical_truncate	xlrec;
@@ -471,6 +476,205 @@ cb_logical_truncate(RelFileNode *rnode,
 		XLogRegisterData((char *) &xlrec, SizeOfCBLogicalTruncate);
 		lsn = XLogInsert(RM_CONVEYOR_ID,
 						 XLOG_CONVEYOR_LOGICAL_TRUNCATE);
+
+		PageSetLSN(metapage, lsn);
+	}
+
+	END_CRIT_SECTION();
+}
+
+/*
+ * Clear a block in preparation for deallocating the segment that contains it.
+ *
+ * The block needs to appear unused to ConveyorBeltPageIsUnused(); a simple
+ * call to PageInit() is the easiest way to accomplish that.
+ *
+ * We could use log_newpage() here but it would generate more WAL.
+ */
+void
+cb_clear_block(RelFileNode *rnode,
+			   ForkNumber fork,
+			   BlockNumber blkno,
+			   Buffer buffer,
+			   bool needs_xlog)
+{
+	Page	page = BufferGetPage(buffer);
+
+	START_CRIT_SECTION();
+
+	PageInit(page, BLCKSZ, 0);
+
+	MarkBufferDirty(buffer);
+
+	if (needs_xlog)
+	{
+		XLogRecPtr	lsn;
+
+		XLogBeginInsert();
+		XLogRegisterBlock(0, rnode, fork, blkno, page,
+						  REGBUF_STANDARD | REGBUF_WILL_INIT);
+		lsn = XLogInsert(RM_CONVEYOR_ID,
+						 XLOG_CONVEYOR_CLEAR_BLOCK);
+
+		PageSetLSN(page, lsn);
+	}
+
+	END_CRIT_SECTION();
+}
+
+/*
+ * Deallocate a payload segment.
+ *
+ * This is a bit tricky. We need to clear the index entry pointing to the
+ * payload segment, and we also need to clear the FSM bit for the segment.
+ * Either, both, or neither of those could be in the metapage.
+ *
+ * If neither is in the metapage, metabuffer should be InvalidBuffer;
+ * otherwise it should be the buffer containing the metapage.
+ *
+ * If the index entry pointing to the payload segment is in the metapage,
+ * then indexblock should be IndavlidBlockNumber and indexbuffer should be
+ * InvalidBuffer; otherwise, they should reference the index page containing
+ * the index entry.
+ *
+ * If the freespace map bit for the segment is in the metapage, then
+ * fsmblock should be InvalidBlockNumber and fsmbuffer should be InvalidBuffer;
+ * otherwise, they should reference the FSM page containing the relevant
+ * freespace map bit.
+ */
+void
+cb_recycle_payload_segment(RelFileNode *rnode,
+						   ForkNumber fork,
+						   Buffer metabuffer,
+						   BlockNumber indexblock,
+						   Buffer indexbuffer,
+						   BlockNumber fsmblock,
+						   Buffer fsmbuffer,
+						   CBSegNo segno,
+						   unsigned pageoffset,
+						   bool needs_xlog)
+{
+	START_CRIT_SECTION();
+
+	if (BufferIsValid(metabuffer))
+	{
+		CBMetapageData *meta;
+
+		Assert(indexblock == InvalidBlockNumber ||
+			   fsmblock == InvalidBlockNumber);
+		meta = cb_metapage_get_special(BufferGetPage(metabuffer));
+		if (indexblock == InvalidBlockNumber)
+			cb_metapage_clear_obsolete_index_entry(meta, segno, pageoffset);
+		if (fsmblock == InvalidBlockNumber)
+			cb_metapage_set_fsm_bit(meta, segno, false);
+		MarkBufferDirty(metabuffer);
+	}
+
+	if (indexblock != InvalidBlockNumber)
+	{
+		cb_indexpage_clear_obsolete_entry(BufferGetPage(indexblock),
+										  segno, pageoffset);
+		MarkBufferDirty(indexbuffer);
+	}
+
+	if (fsmblock != InvalidBlockNumber)
+	{
+		cb_fsmpage_set_fsm_bit(BufferGetPage(fsmbuffer), segno, false);
+		MarkBufferDirty(fsmbuffer);
+	}
+
+	if (needs_xlog)
+	{
+		xl_cb_recycle_payload_segment xlrec;
+		XLogRecPtr	lsn;
+
+		xlrec.segno = segno;
+		xlrec.pageoffset = pageoffset;
+
+		XLogBeginInsert();
+		if (BufferIsValid(metabuffer))
+			XLogRegisterBlock(0, rnode, fork, CONVEYOR_METAPAGE,
+							  BufferGetPage(metabuffer), REGBUF_STANDARD);
+		if (indexblock != InvalidBlockNumber)
+			XLogRegisterBlock(1, rnode, fork, indexblock,
+							  BufferGetPage(indexbuffer), REGBUF_STANDARD);
+		if (fsmblock != InvalidBlockNumber)
+			XLogRegisterBlock(2, rnode, fork, fsmblock,
+							  BufferGetPage(fsmbuffer), REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec, SizeOfCBShiftMetapageIndex);
+		lsn = XLogInsert(RM_CONVEYOR_ID,
+						 XLOG_CONVEYOR_SHIFT_METAPAGE_INDEX);
+
+		if (indexblock != InvalidBlockNumber)
+			PageSetLSN(BufferGetPage(indexbuffer), lsn);
+		if (fsmblock != InvalidBlockNumber)
+			PageSetLSN(BufferGetPage(fsmbuffer), lsn);
+	}
+
+	END_CRIT_SECTION();
+}
+
+/*
+ * Deallocate an index segment.
+ *
+ * indexblock and indexbuffer shuolud refer to the first block of the segment
+ * to be deallocated. It's the oldest index segment, so we can't clear it
+ * in advance, else we'd lose track of what other index segments exist.
+ *
+ * fsmblock and fsmbuffer should refer to the FSM page that contains the
+ * FSM bit for the segment to be freed. If the segment is covered by the
+ * metapage, pass InvalidBlockNumber and InvalidBuffer, respectively.
+ */
+void
+cb_recycle_index_segment(RelFileNode *rnode,
+						 ForkNumber fork,
+						 Buffer metabuffer,
+						 BlockNumber indexblock,
+						 Buffer indexbuffer,
+						 BlockNumber fsmblock,
+						 Buffer fsmbuffer,
+						 CBSegNo segno,
+						 bool needs_xlog)
+{
+	elog(ERROR, "XXX cb_recycle_index_segment not implemented yet");
+}
+
+/*
+ * Shift the start of the metapage index by discarding a given number
+ * of already-cleared index entries.
+ */
+void
+cb_shift_metapage_index(RelFileNode *rnode,
+						ForkNumber fork,
+						Buffer metabuffer,
+						unsigned num_entries,
+						bool needs_xlog)
+{
+	Page		metapage;
+	CBMetapageData *meta;
+
+	metapage = BufferGetPage(metabuffer);
+	meta = cb_metapage_get_special(metapage);
+
+	START_CRIT_SECTION();
+
+	cb_metapage_remove_index_entries(meta, num_entries, false);
+
+	MarkBufferDirty(metabuffer);
+
+	if (needs_xlog)
+	{
+		xl_cb_shift_metapage_index xlrec;
+		XLogRecPtr	lsn;
+
+		xlrec.num_entries = num_entries;
+
+		XLogBeginInsert();
+		XLogRegisterBlock(0, rnode, fork, CONVEYOR_METAPAGE, metapage,
+						  REGBUF_STANDARD);
+		XLogRegisterData((char *) &xlrec, SizeOfCBShiftMetapageIndex);
+		lsn = XLogInsert(RM_CONVEYOR_ID,
+						 XLOG_CONVEYOR_SHIFT_METAPAGE_INDEX);
 
 		PageSetLSN(metapage, lsn);
 	}

@@ -93,4 +93,37 @@ extern void cb_logical_truncate(RelFileNode *rnode,
 								CBPageNo oldest_keeper,
 								bool needs_xlog);
 
+extern void cb_clear_block(RelFileNode *rnode,
+						   ForkNumber fork,
+						   BlockNumber blkno,
+						   Buffer buffer,
+						   bool needs_xlog);
+
+extern void cb_recycle_payload_segment(RelFileNode *rnode,
+									   ForkNumber fork,
+									   Buffer metabuffer,
+									   BlockNumber indexblock,
+									   Buffer indexbuffer,
+									   BlockNumber fsmblock,
+									   Buffer fsmbuffer,
+									   CBSegNo segno,
+									   unsigned pageoffset,
+									   bool needs_xlog);
+
+extern void cb_recycle_index_segment(RelFileNode *rnode,
+									 ForkNumber fork,
+									 Buffer metabuffer,
+									 BlockNumber indexblock,
+									 Buffer indexbuffer,
+									 BlockNumber fsmblock,
+									 Buffer fsmbuffer,
+									 CBSegNo segno,
+									 bool needs_xlog);
+
+extern void cb_shift_metapage_index(RelFileNode *rnode,
+									ForkNumber fork,
+									Buffer metabuffer,
+									unsigned num_entries,
+									bool needs_xlog);
+
 #endif							/* CBMODIFY_H */

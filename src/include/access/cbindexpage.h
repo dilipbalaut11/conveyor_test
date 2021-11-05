@@ -44,6 +44,9 @@ extern void cb_indexpage_add_index_entries(Page page,
 										   unsigned pageoffset,
 										   unsigned num_index_entries,
 										   CBSegNo *index_entries);
+extern void cb_indexpage_clear_obsolete_entry(Page page,
+											  CBSegNo segno,
+											  unsigned pageoffset);
 extern void cb_indexpage_set_next_segment(Page page, CBSegNo segno);
 extern CBSegNo cb_indexpage_get_next_segment(Page page);
 

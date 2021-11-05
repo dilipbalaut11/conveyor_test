@@ -27,8 +27,12 @@ static CBSegNo ConveyorSearchFSMPages(ConveyorBelt *cb,
 									  CBSegNo next_segment,
 									  BlockNumber *fsmblock,
 									  Buffer *fsmbuffer);
+static void ConveyorBeltClearSegment(ConveyorBelt *cb, CBSegNo segno,
+									 bool include_first_page);
 static Buffer ConveyorBeltExtend(ConveyorBelt *cb, BlockNumber blkno,
 								 BlockNumber *possibly_not_on_disk_blkno);
+static BlockNumber ConveyorBeltFSMBlockNumber(ConveyorBelt *cb,
+											  CBSegNo segno);
 static Buffer ConveyorBeltRead(ConveyorBelt *cb, BlockNumber blkno, int mode);
 static Buffer ConveyorBeltPageIsUnused(Page page);
 
@@ -199,6 +203,9 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	 * lifetime of this function. Since we'll return with buffer locks held,
 	 * the caller had better not do anything like that either, so this should
 	 * also still be valid when ConveyorBeltPerformInsert is called.
+	 *
+	 * XXX. This seems totally bogus, because we should really be doing
+	 * CHECK_FOR_INTERRUPTS(), and that might accept invalidation messages.
 	 */
 	cb->cb_insert_relfilenode =
 		&RelationGetSmgr(cb->cb_rel)->smgr_rnode.node;
@@ -971,6 +978,212 @@ ConveyorBeltLogicalTruncate(ConveyorBelt *cb, CBPageNo oldest_keeper)
 }
 
 /*
+ * Recycle segments that are no longer needed.
+ *
+ * Payload segments all of whose pages precede the logical truncation point
+ * can be deallocated. Index segments can be deallocated once they no longer
+ * contain any pointers to payload segments.
+ *
+ * Only one backend should call this at a time for any given conveyor belt.
+ */
+void
+ConveyorBeltVacuum(ConveyorBelt *cb)
+{
+	Buffer		metabuffer;
+	BlockNumber	fsmblock = CONVEYOR_METAPAGE;
+	Buffer		fsmbuffer = InvalidBuffer;
+	CBSegNo		cleared_segno = CB_INVALID_SEGMENT;
+	bool		needs_xlog;
+
+	/* Do any changes we make here need to be WAL-logged? */
+	needs_xlog = RelationNeedsWAL(cb->cb_rel) || cb->cb_fork == INIT_FORKNUM;
+
+	/* Read and pin the metapage. */
+	metabuffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork, CONVEYOR_METAPAGE,
+									RBM_NORMAL, NULL);
+	LockBuffer(metabuffer, BUFFER_LOCK_EXCLUSIVE);
+
+	/*
+	 * Main loop.
+	 *
+	 * At the top of each loop iteration, the metabuffer is pinned and
+	 * exclusively locked.  The lock and even the pin may be released by code
+	 * inside this loop, but they must be reacquired before beginning the next
+	 * iteration.
+	 */
+	while (1)
+	{
+		CBMetapageData	   *meta;
+		CBMObsoleteState	obsolete_state;
+		CBSegNo		oldest_index_segment;
+		CBSegNo		metapage_segno;
+		unsigned	metapage_offset;
+
+		/* Assess what kind of work needs to be done. */
+		meta = cb_metapage_get_special(BufferGetPage(metabuffer));
+		obsolete_state =
+			cb_metapage_get_obsolete_state(meta, &oldest_index_segment,
+										   &metapage_segno, &metapage_offset);
+
+		/*
+		 * If on the previous pass through the loop we concluded that we need
+		 * to free a payload segment refrenced by the metapage and if that no
+		 * longer seems like the thing we need to do, then release any lock and
+		 * pin we may have acquired in preparation for freeing that payload
+		 * segment.
+		 */
+		if ((obsolete_state != CBM_OBSOLETE_METAPAGE_ENTRIES ||
+			metapage_segno != cleared_segno) && fsmblock != CONVEYOR_METAPAGE)
+		{
+			UnlockReleaseBuffer(fsmbuffer);
+			fsmblock = CONVEYOR_METAPAGE;
+			fsmbuffer = InvalidBuffer;
+		}
+
+		/*
+		 * Attempt to do whatever useful work seems to be possible based on
+		 * obsolete_state.
+		 */
+		if (obsolete_state == CBM_OBSOLETE_NOTHING)
+		{
+			/*
+			 * There is nothing to vacuum.
+			 */
+			UnlockReleaseBuffer(metabuffer);
+			return;
+		}
+		else if (obsolete_state == CBM_OBSOLETE_METAPAGE_START)
+		{
+			/*
+			 * No real work to do, but there are some already-cleared entries
+			 * at the start of the metapage which we should remove to make more
+			 * space for new entries.
+			 */
+			cb_shift_metapage_index(&RelationGetSmgr(cb->cb_rel)->smgr_rnode.node,
+									cb->cb_fork, metabuffer, metapage_offset, needs_xlog);
+			UnlockReleaseBuffer(metabuffer);
+			return;
+		}
+		else if (obsolete_state == CBM_OBSOLETE_METAPAGE_ENTRIES)
+		{
+			/*
+			 * The metapage contains entries for one or more payload segments
+			 * which can be deallocated.
+			 */
+			if (metapage_segno != cleared_segno)
+			{
+				/*
+				 * We can only recycle a payload segment after clearing the
+				 * pages in that segment. Since we have not done that yet,
+				 * do it now. First release the buffer lock on the metapage,
+				 * to avoid interefering with other use of the conveyor belt.
+				 */
+				LockBuffer(metabuffer, BUFFER_LOCK_UNLOCK);
+				ConveyorBeltClearSegment(cb, metapage_segno, true);
+				cleared_segno = metapage_segno;
+
+				/*
+				 * Lock the relevant FSM page, if it's not the metapage.
+				 * Per src/backend/access/conveyor/README's locking rules,
+				 * we must do this before relocking the metapage.
+				 */
+				fsmblock = ConveyorBeltFSMBlockNumber(cb, cleared_segno);
+				if (fsmblock == CONVEYOR_METAPAGE)
+					fsmbuffer = metabuffer;
+				else
+					fsmbuffer = ConveyorBeltRead(cb, fsmblock,
+												 BUFFER_LOCK_EXCLUSIVE);
+
+
+				/*
+				 * OK, now reacquire a lock on the metapage and loop around.
+				 * Hopefully, the next pass will succeed in freeing a payload
+				 * segment.
+				 */
+				LockBuffer(metabuffer, BUFFER_LOCK_EXCLUSIVE);
+			}
+			else
+			{
+				/*
+				 * The previous pass through the loop made preparations to
+				 * free this payload segment, so now we can do it.
+				 */
+				cb_recycle_payload_segment(&RelationGetSmgr(cb->cb_rel)->smgr_rnode.node,
+										   cb->cb_fork,
+										   metabuffer,
+										   InvalidBlockNumber, InvalidBuffer,
+										   fsmblock, fsmbuffer,
+										   cleared_segno, metapage_offset,
+										   needs_xlog);
+			}
+		}
+		else if (obsolete_state == CBM_OBSOLETE_SEGMENT_ENTRIES)
+		{
+			/*
+			 * XXX.
+			 *
+			 * 1. Walk the chain of index segments while keeping a pin on the
+			 * metabuffer and the current index segment.
+			 *
+			 * 2. As we do, reinitialize payload segments and free them.
+			 *
+			 * 3. Then, get a cleanup lock on the metapage and try to free as
+			 * many old index segments as we can. We can remember which ones
+			 * are eligible based on what we know we cleared (or found
+			 * already cleared).
+			 */
+			elog(ERROR, "CBM_OBSOLETE_SEGMENT_ENTRIES case is not implemented yet");
+		}
+	}
+}
+
+/*
+ * Clear all pages in a segment, or alternatively all pages in a segment
+ * except for the first one. The segment can be a payload segment that isn't
+ * needed any more (in which case we should clear all the pages) or the oldest
+ * index segment from which all index entries have been cleared (in which
+ * case we should clear all pages but the first).
+ *
+ * This needs to leave each page in a state where ConveyorBeltPageIsUnused
+ * would return true. Otherwise, if this is reused as a payload segment,
+ * ConveyorBeltGetNewPage will get confused, as the pages it's trying to
+ * allocate will seem to have been concurrently allocated by some other
+ * backend.
+ *
+ * This needs to take a cleanup lock on each page to make sure that there are
+ * no lingering locks or pins on the page.
+ */
+static void
+ConveyorBeltClearSegment(ConveyorBelt *cb, CBSegNo segno,
+						 bool include_first_page)
+{
+	BlockNumber	firstblkno;
+	BlockNumber	stopblkno;
+	BlockNumber	blkno;
+	bool		needs_xlog;
+
+	firstblkno = cb_segment_to_block(cb->cb_pages_per_segment, segno, 0);
+	if (!include_first_page)
+		firstblkno++;
+	stopblkno = firstblkno + cb->cb_pages_per_segment;
+	needs_xlog = RelationNeedsWAL(cb->cb_rel) || cb->cb_fork == INIT_FORKNUM;
+
+	for (blkno = firstblkno; blkno < stopblkno; ++blkno)
+	{
+		Buffer	buffer;
+
+		CHECK_FOR_INTERRUPTS();
+
+		buffer = ReadBufferExtended(cb->cb_rel, cb->cb_fork, blkno,
+									RBM_NORMAL, NULL);
+		LockBufferForCleanup(buffer);
+		cb_clear_block(&RelationGetSmgr(cb->cb_rel)->smgr_rnode.node,
+					   cb->cb_fork, blkno, buffer, needs_xlog);
+		UnlockReleaseBuffer(buffer);
+	}
+}
+
+/*
  * Pin and return the block indicated by 'blkno', extending if needed.
  *
  * On entry, *possibly_not_on_disk_blkno should be the smallest block number
@@ -1064,6 +1277,30 @@ ConveyorBeltExtend(ConveyorBelt *cb, BlockNumber blkno,
 	/* Remember that the relation is now longer than it used to be. */
 	*possibly_not_on_disk_blkno = blkno + 1;
 	return buffer;
+}
+
+/*
+ * Figure out where the FSM bit for a given segment number is located.
+ *
+ * Returns CONVEYOR_METAPAGE if the segment's FSM bit is in the metapage,
+ * or otherwise the block number of the FSM page that contains that FSM bit.
+ */
+BlockNumber
+ConveyorBeltFSMBlockNumber(ConveyorBelt *cb, CBSegNo segno)
+{
+	BlockNumber firstblkno;
+	unsigned	stride;
+	unsigned	whichfsmpage;
+
+	if (segno < CB_FSM_SEGMENTS_FOR_METAPAGE)
+		return CONVEYOR_METAPAGE;
+
+	firstblkno = cb_first_fsm_block(cb->cb_pages_per_segment);
+	stride = cb_fsm_block_spacing(cb->cb_pages_per_segment);
+	whichfsmpage = (segno - CB_FSM_SEGMENTS_FOR_METAPAGE)
+		/ CB_FSM_SEGMENTS_PER_FSMPAGE;
+
+	return firstblkno + (stride * whichfsmpage);
 }
 
 /*

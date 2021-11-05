@@ -99,6 +99,26 @@ cb_indexpage_add_index_entries(Page page,
 }
 
 /*
+ * Clear the obsolete index entry for the given segment from the given page
+ * offset.
+ */
+void
+cb_indexpage_clear_obsolete_entry(Page page,
+								  CBSegNo segno,
+								  unsigned pageoffset)
+{
+	CBIndexPageData *ipd = cb_indexpage_get_special(page);
+
+	if (pageoffset >= CB_INDEXPAGE_INDEX_ENTRIES)
+		elog(ERROR, "page offset %u out of range", pageoffset);
+	if (ipd->cbidx_entry[pageoffset] != segno)
+		elog(ERROR, "while clearing index entry %u, found %u where %u was expected",
+			 pageoffset, ipd->cbidx_entry[pageoffset], segno);
+
+	ipd->cbidx_entry[pageoffset] = CB_INVALID_SEGMENT;
+}
+
+/*
  * Set the next index segment.
  *
  * This should only be used on the first page of an index segment, since

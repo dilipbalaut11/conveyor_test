@@ -83,6 +83,45 @@ conveyor_desc(StringInfo buf, XLogReaderState *record)
 								 xlrec->oldest_keeper);
 				break;
 			}
+
+		case XLOG_CONVEYOR_CLEAR_BLOCK:
+			{
+				/* Nothing extra to print. */
+				break;
+			}
+
+		case XLOG_CONVEYOR_RECYCLE_PAYLOAD_SEGMENT:
+			{
+				xl_cb_recycle_payload_segment *xlrec;
+
+				xlrec = (xl_cb_recycle_payload_segment *) rec;
+
+				appendStringInfo(buf, "segno %u pageoffset %u",
+								 xlrec->segno, xlrec->pageoffset);
+				break;
+			}
+
+		case XLOG_CONVEYOR_RECYCLE_INDEX_SEGMENT:
+			{
+				xl_cb_recycle_index_segment *xlrec;
+
+				xlrec = (xl_cb_recycle_index_segment *) rec;
+
+				appendStringInfo(buf, "segno %u",
+								 xlrec->segno);
+				break;
+			}
+
+		case XLOG_CONVEYOR_SHIFT_METAPAGE_INDEX:
+			{
+				xl_cb_shift_metapage_index *xlrec;
+
+				xlrec = (xl_cb_shift_metapage_index *) rec;
+
+				appendStringInfo(buf, "num_entries %u",
+								 xlrec->num_entries);
+				break;
+			}
 	}
 }
 
@@ -110,6 +149,18 @@ conveyor_identify(uint8 info)
 			break;
 		case XLOG_CONVEYOR_LOGICAL_TRUNCATE:
 			id = "LOGICAL_TRUNCATE";
+			break;
+		case XLOG_CONVEYOR_CLEAR_BLOCK:
+			id = "CLEAR_BLOCK";
+			break;
+		case XLOG_CONVEYOR_RECYCLE_PAYLOAD_SEGMENT:
+			id = "RECYCLE_PAYLOAD_SEGMENT";
+			break;
+		case XLOG_CONVEYOR_RECYCLE_INDEX_SEGMENT:
+			id = "RECYCLE_INDEX_SEGMENT";
+			break;
+		case XLOG_CONVEYOR_SHIFT_METAPAGE_INDEX:
+			id = "SHIFT_METAPAGE_INDEX";
 			break;
 	}
 

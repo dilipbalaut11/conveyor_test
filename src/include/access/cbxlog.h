@@ -25,6 +25,10 @@
 #define	XLOG_CONVEYOR_ALLOCATE_INDEX_PAGE			0x40
 #define XLOG_CONVEYOR_RELOCATE_INDEX_ENTRIES		0x50
 #define XLOG_CONVEYOR_LOGICAL_TRUNCATE				0x60
+#define XLOG_CONVEYOR_CLEAR_BLOCK					0x70
+#define XLOG_CONVEYOR_RECYCLE_PAYLOAD_SEGMENT		0x80
+#define XLOG_CONVEYOR_RECYCLE_INDEX_SEGMENT			0x90
+#define XLOG_CONVEYOR_SHIFT_METAPAGE_INDEX			0xA0
 
 typedef struct xl_cb_allocate_payload_segment
 {
@@ -71,6 +75,31 @@ typedef struct xl_cb_logical_truncate
 
 #define SizeOfCBLogicalTruncate \
 	(offsetof(xl_cb_logical_truncate, oldest_keeper) + sizeof(CBPageNo))
+
+typedef struct xl_cb_recycle_payload_segment
+{
+	CBSegNo		segno;
+	unsigned	pageoffset;
+} xl_cb_recycle_payload_segment;
+
+#define SizeOfCBRecyclePayloadSegment \
+	(offsetof(xl_cb_recycle_payload_segment, segno) + sizeof(CBSegNo))
+
+typedef struct xl_cb_recycle_index_segment
+{
+	CBSegNo		segno;
+} xl_cb_recycle_index_segment;
+
+#define SizeOfCBRecycleIndexSegment \
+	(offsetof(xl_cb_recycle_index_segment, segno) + sizeof(CBSegNo))
+
+typedef struct xl_cb_shift_metapage_index
+{
+	unsigned	num_entries;
+} xl_cb_shift_metapage_index;
+
+#define SizeOfCBShiftMetapageIndex \
+	(offsetof(xl_cb_shift_metapage_index, num_entries) + sizeof(unsigned))
 
 extern void conveyor_desc(StringInfo buf, XLogReaderState *record);
 extern void conveyor_redo(XLogReaderState *record);

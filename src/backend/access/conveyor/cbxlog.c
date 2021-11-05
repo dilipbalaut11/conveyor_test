@@ -275,6 +275,128 @@ cb_xlog_logical_truncate(XLogReaderState *record)
 }
 
 /*
+ * REDO function for cb_clear_block.
+ */
+static void
+cb_xlog_clear_block(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	Buffer		buffer;
+	Page		page;
+
+	buffer = XLogInitBufferForRedo(record, 0);
+	page = BufferGetPage(buffer);
+	PageInit(page, 0, BLCKSZ);
+	PageSetLSN(page, lsn);
+	MarkBufferDirty(buffer);
+
+	UnlockReleaseBuffer(buffer);
+}
+
+/*
+ * REDO function for cb_recycle_payload_segment.
+ */
+static void
+cb_xlog_recycle_payload_segment(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_cb_recycle_payload_segment *xlrec;
+	bool		have_metapage;
+	bool		have_index_page;
+	bool		have_fsm_page;
+	Buffer		fsmbuffer = InvalidBuffer;
+	Buffer		indexbuffer = InvalidBuffer;
+	Buffer		metabuffer = InvalidBuffer;
+
+	have_metapage = XLogRecGetBlockTag(record, 0, NULL, NULL, NULL);
+	have_index_page = XLogRecGetBlockTag(record, 1, NULL, NULL, NULL);
+	have_fsm_page = XLogRecGetBlockTag(record, 2, NULL, NULL, NULL);
+
+	xlrec = (xl_cb_recycle_payload_segment *) XLogRecGetData(record);
+
+	if (have_index_page &&
+		XLogReadBufferForRedo(record, 1, &indexbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	indexpage = BufferGetPage(indexbuffer);
+
+		cb_indexpage_clear_obsolete_entry(indexpage, xlrec->segno,
+										  xlrec->pageoffset);
+		PageSetLSN(indexpage, lsn);
+		MarkBufferDirty(indexbuffer);
+	}
+
+	if (have_fsm_page &&
+		XLogReadBufferForRedo(record, 2, &fsmbuffer) == BLK_NEEDS_REDO)
+	{
+		Page	fsmpage = BufferGetPage(fsmbuffer);
+
+		cb_fsmpage_set_fsm_bit(fsmpage, xlrec->segno, false);
+		PageSetLSN(fsmpage, lsn);
+		MarkBufferDirty(fsmbuffer);
+	}
+
+	/* last due to lock ordering rules; see README */
+	if (have_metapage &&
+		XLogReadBufferForRedo(record, 0, &metabuffer) == BLK_NEEDS_REDO)
+	{
+		Page	metapage = BufferGetPage(metabuffer);
+		CBMetapageData *meta;
+
+		meta = cb_metapage_get_special(metapage);
+		if (!have_index_page)
+			cb_metapage_clear_obsolete_index_entry(meta, xlrec->segno,
+												   xlrec->pageoffset);
+		if (!have_fsm_page)
+			cb_metapage_set_fsm_bit(meta, xlrec->segno, false);
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
+
+	if (BufferIsValid(fsmbuffer))
+		UnlockReleaseBuffer(fsmbuffer);
+	if (BufferIsValid(indexbuffer))
+		UnlockReleaseBuffer(indexbuffer);
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
+}
+
+/*
+ * REDO function for cb_recycle_index_segment.
+ */
+static void
+cb_xlog_recycle_index_segment(XLogReaderState *record)
+{
+	elog(ERROR, "XXX cb_xlog_recycle_index_segment not implemented yet");
+}
+
+/*
+ * REDO function for cb_shift_metapage_index.
+ */
+static void
+cb_xlog_shift_metapage_index(XLogReaderState *record)
+{
+	XLogRecPtr	lsn = record->EndRecPtr;
+	xl_cb_shift_metapage_index *xlrec;
+	Buffer		metabuffer;
+
+	xlrec = (xl_cb_shift_metapage_index *) XLogRecGetData(record);
+
+	if (XLogReadBufferForRedo(record, 0, &metabuffer) == BLK_NEEDS_REDO)
+	{
+		Page	metapage = BufferGetPage(metabuffer);
+		CBMetapageData *meta;
+
+		meta = cb_metapage_get_special(metapage);
+		cb_metapage_remove_index_entries(meta, xlrec->num_entries, false);
+		PageSetLSN(metapage, lsn);
+		MarkBufferDirty(metabuffer);
+	}
+
+	if (BufferIsValid(metabuffer))
+		UnlockReleaseBuffer(metabuffer);
+}
+
+/*
  * Main entrypoint for conveyor belt REDO.
  */
 void
@@ -301,6 +423,18 @@ conveyor_redo(XLogReaderState *record)
 			break;
 		case XLOG_CONVEYOR_LOGICAL_TRUNCATE:
 			cb_xlog_logical_truncate(record);
+			break;
+		case XLOG_CONVEYOR_CLEAR_BLOCK:
+			cb_xlog_clear_block(record);
+			break;
+		case XLOG_CONVEYOR_RECYCLE_PAYLOAD_SEGMENT:
+			cb_xlog_recycle_payload_segment(record);
+			break;
+		case XLOG_CONVEYOR_RECYCLE_INDEX_SEGMENT:
+			cb_xlog_recycle_index_segment(record);
+			break;
+		case XLOG_CONVEYOR_SHIFT_METAPAGE_INDEX:
+			cb_xlog_shift_metapage_index(record);
 			break;
 		default:
 			elog(PANIC, "conveyor_redo: unknown op code %u", info);

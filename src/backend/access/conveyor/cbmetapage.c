@@ -498,6 +498,9 @@ cb_metapage_remove_index_segment(CBMetapageData *meta, CBSegNo segno)
  * If the return value is CBM_OBSOLETE_METAPAGE_START, then there are
  * no index segments and no uncleared index entries in the metapage that
  * are obsolete, but some cleared index entries can be discarded.
+ * *metapage_offset will be set to the smallest metapage offset that cannot
+ * be cleared (either because it is still in use, or because it is not yet
+ * allocated).
  *
  * If the return value is CBM_OBSOLETE_NOTHING, there's nothing to do.
  */
@@ -583,6 +586,7 @@ cb_metapage_get_obsolete_state(CBMetapageData *meta,
 	 * Apparently, there's nothing left to do but discard already-cleared
 	 * index entries.
 	 */
+	*metapage_offset = keep_offset;
 	return CBM_OBSOLETE_METAPAGE_START;
 }
 
