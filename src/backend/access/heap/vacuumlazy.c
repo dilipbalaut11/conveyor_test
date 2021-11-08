@@ -482,8 +482,9 @@ static void restore_vacuum_error_info(LVRelState *vacrel,
 									  const LVSavedErrInfo *saved_vacrel);
 static void lazy_add_deadtids(Relation rel, int ntids,
 							  ItemPointerData *deadtids);
-static int lazy_get_deadtids(ConveyorBelt *cb, CBPageNo start_pageno,
-							 int maxtids, ItemPointerData *deadtids,
+static int lazy_get_deadtids(ConveyorBelt *cb, CBPageNo from_pageno,
+							 CBPageNo to_pageno, int maxtids,
+							 ItemPointerData *deadtids,
 							 CBPageNo *last_pageread);
 static void lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params);
 static void UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno);
@@ -3218,9 +3219,10 @@ lazy_add_deadtids(Relation rel, int ntids, ItemPointerData *deadtids)
  *
  * Returns number of dead tids actually read from the storage.
  */
-int
-lazy_get_deadtids(ConveyorBelt *cb, CBPageNo start_pageno, int maxtids,
-				  ItemPointerData *deadtids, CBPageNo *last_pageread)
+static int
+lazy_get_deadtids(ConveyorBelt *cb, CBPageNo from_pageno,
+				  CBPageNo to_pageno, int maxtids, ItemPointerData *deadtids,
+				  CBPageNo *last_pageread)
 {
 	Page			page;
 	Buffer			buffer;
@@ -3228,7 +3230,7 @@ lazy_get_deadtids(ConveyorBelt *cb, CBPageNo start_pageno, int maxtids,
 	CBPageNo		next_pageno;
 	int				count;
 	int				ndeadtids = 0;
-	int				prevpageno = start_pageno;
+	int				prevpageno = from_pageno;
 
 	/* 
 	 * Read the conveyor belt bounds and check page validity,
@@ -3236,13 +3238,16 @@ lazy_get_deadtids(ConveyorBelt *cb, CBPageNo start_pageno, int maxtids,
 	 * checking.
 	 */
 	ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
-	if (start_pageno < oldest_pageno || start_pageno >= next_pageno)
+	if (from_pageno < oldest_pageno || from_pageno >= next_pageno)
 		return 0;
 
+	if (to_pageno != CB_INVALID_LOGICAL_PAGE && to_pageno < next_pageno)
+		next_pageno = to_pageno;
+
 	/* Loop until we read maxtids. */
-	while(ndeadtids < maxtids && start_pageno < next_pageno)
+	while(ndeadtids < maxtids && from_pageno < next_pageno)
 	{
-		buffer = ConveyorBeltReadBuffer(cb, start_pageno, BUFFER_LOCK_SHARE, NULL);
+		buffer = ConveyorBeltReadBuffer(cb, from_pageno, BUFFER_LOCK_SHARE, NULL);
 		if (BufferIsInvalid(buffer))
 			break;
 
@@ -3262,8 +3267,8 @@ lazy_get_deadtids(ConveyorBelt *cb, CBPageNo start_pageno, int maxtids,
 		UnlockReleaseBuffer(buffer);
 
 		ndeadtids += count;
-		prevpageno = start_pageno;
-		start_pageno++;
+		prevpageno = from_pageno;
+		from_pageno++;
 	}
 
 	*last_pageread = prevpageno;
@@ -3333,6 +3338,7 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 	{
 		/* Read dead tids from the dead tuple store. */
 		dead_tuples->num_tuples = lazy_get_deadtids(cb, start_pageno,
+													CB_INVALID_LOGICAL_PAGE,
 													dead_tuples->max_tuples,
 													dead_tuples->itemptrs,
 													&last_pageread);
@@ -3378,8 +3384,8 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 static void
 lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 {
-	CBPageNo	min_pageno = CB_INVALID_LOGICAL_PAGE;
-	CBPageNo	start_pageno;
+	CBPageNo	from_pageno;
+	CBPageNo	to_pageno = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	last_pageread;
 	int			i;
 	LVDeadTuples   *dead_tuples;
@@ -3394,9 +3400,9 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	 */
 	for (i = 0; i < vacrel->nindexes; i++)
 	{
-		if (min_pageno == CB_INVALID_LOGICAL_PAGE ||
-			vacrel->indrels[i]->rd_rel->cbvacuumpage < min_pageno)
-			min_pageno = vacrel->indrels[i]->rd_rel->cbvacuumpage;
+		if (to_pageno == CB_INVALID_LOGICAL_PAGE ||
+			vacrel->indrels[i]->rd_rel->cbvacuumpage < to_pageno)
+			to_pageno = vacrel->indrels[i]->rd_rel->cbvacuumpage;
 	}
 
 	/*
@@ -3408,22 +3414,17 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	dead_tuples = vacrel->dead_tuples;
 
 	/* Get the next cbpage from where we want to start vacuum. */
-	start_pageno = vacrel->rel->rd_rel->cbvacuumpage;
+	from_pageno = vacrel->rel->rd_rel->cbvacuumpage;
 
 	/* Open the conveyor belt. */
 	cb = ConveyorBeltOpen(vacrel->rel, DEADTID_FORKNUM, CurrentMemoryContext);
 
 	/* Loop until we complete the heap vacuum. */
-	while(start_pageno <= min_pageno)
+	while(from_pageno <= to_pageno)
 	{
-		/* Read dead tids from the dead tuple store. */
-		dead_tuples->num_tuples =
-							DTS_ReadDeadTids(vacrel->rel, start_pageno,
-											 dead_tuples->max_tuples,
-											 dead_tuples->itemptrs,
-											 &last_pageread);
-		/* Read dead tids from the dead tuple store. */
-		dead_tuples->num_tuples = lazy_get_deadtids(cb, start_pageno,
+		/* Read dead tids from the conveyor belt. */
+		dead_tuples->num_tuples = lazy_get_deadtids(cb, from_pageno,
+													to_pageno,
 													dead_tuples->max_tuples,
 													dead_tuples->itemptrs,
 													&last_pageread);
@@ -3435,8 +3436,14 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 		lazy_vacuum_heap_rel(vacrel, true);
 
 		/* Go to the next logical page. */
-		start_pageno = last_pageread + 1;
+		from_pageno = last_pageread + 1;
 	}
+
+	/* Truncate the conveyor belt pages. */
+	ConveyorBeltLogicalTruncate(cb, to_pageno);
+
+	/* FIXME: When to call Vacuum. */
+	ConveyorBeltVacuum(cb);
 
 	/*
 	 * Set the conveyor belt pageno upto which we have already vacuumed so that
