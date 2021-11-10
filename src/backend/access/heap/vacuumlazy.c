@@ -314,6 +314,16 @@ typedef struct LVParallelState
 	int			nindexes_parallel_condcleanup;
 } LVParallelState;
 
+/*
+ * Dead tid fork state.
+ */
+typedef struct LVDeadTidForkState
+{
+	ConveyorBelt   *cb;				/* Conveyor belt reference.*/
+	LVDeadTuples   *dead_tuples;	/* Conveyor belt dead tuple cache. */
+	Tuplesortstate *sortstate;		/* state data for tuplesort.c */
+} LVDeadTidForkState;
+
 typedef struct LVRelState
 {
 	/* Target heap relation and its indexes */
@@ -381,6 +391,9 @@ typedef struct LVRelState
 									 * table */
 	int64		num_tuples;		/* total number of nonremovable tuples */
 	int64		live_tuples;	/* live tuples (reltuples estimate) */
+
+	/* dead tid fork state */
+	LVDeadTidForkState	*deadtidstate;
 } LVRelState;
 
 /*
@@ -486,6 +499,8 @@ static int lazy_get_deadtids(ConveyorBelt *cb, CBPageNo from_pageno,
 							 CBPageNo to_pageno, int maxtids,
 							 ItemPointerData *deadtids,
 							 CBPageNo *last_pageread);
+static void lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno);
+bool lazy_check_deadtid(LVRelState *vacrel, ItemPointerData *tid);
 static void lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params);
 static void UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno);
 
@@ -1404,6 +1419,15 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 		}
 
 		/*
+		 * If we are doing the first pass only then before calling prune for
+		 * new block ensure that the dead tids from from dead tid fork is
+		 * already in the cache, so that we can avoid adding the duplicate
+		 * tids.
+		 */
+		if (params->options & VACOPT_FIRST_PASS)
+			lazy_load_deadtids(vacrel, blkno);
+
+		/*
 		 * Prune and freeze tuples.
 		 *
 		 * Accumulates details of remaining LP_DEAD line pointers on page in
@@ -2097,7 +2121,8 @@ retry:
 		for (int i = 0; i < lpdead_items; i++)
 		{
 			ItemPointerSetOffsetNumber(&tmp, deadoffsets[i]);
-			dead_tuples->itemptrs[dead_tuples->num_tuples++] = tmp;
+			if (!lazy_check_deadtid(vacrel, &tmp))
+				dead_tuples->itemptrs[dead_tuples->num_tuples++] = tmp;
 		}
 
 		Assert(dead_tuples->num_tuples <= dead_tuples->max_tuples);
@@ -3277,6 +3302,148 @@ lazy_get_deadtids(ConveyorBelt *cb, CBPageNo from_pageno,
 }
 
 /*
+ * lazy_load_deadtids - load deadtid from conveyor belt into the cache.
+ */
+static void
+lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
+{
+	SMgrRelation	reln;
+	LVDeadTuples   *dead_tuples;
+
+	/* Open the relation at smgr level. */
+	reln = RelationGetSmgr(vacrel->rel);
+
+	/* If the dead_tid fork doesn't exist then nothing to do. */
+	if (!smgrexists(reln, DEADTID_FORKNUM))
+		return;
+
+	/* If deadtidstate is not yeat allocated then allocate it now. */
+	if (vacrel->deadtidstate == NULL)
+	{
+		ConveyorBelt   *cb;
+		CBPageNo		oldest_pageno;
+		CBPageNo		next_pageno;
+		CBPageNo		last_pageread;
+		long			maxtuples;
+
+		vacrel->deadtidstate = palloc0(sizeof(LVDeadTidForkState));
+		vacrel->deadtidstate->cb = cb = ConveyorBeltOpen(vacrel->rel,
+														 DEADTID_FORKNUM,
+														 CurrentMemoryContext);
+
+		/*
+		 * FIXME: instead of using complete maintenance_work_mem, we need to
+		 * divide this between the cache and the new deadtids.  maybe we can
+		 * leave some space for new deadtids, and when that is full we can
+		 * flush that out to the conveyor belt.
+		 */
+		maxtuples = compute_max_dead_tuples(InvalidBlockNumber, true);
+
+		dead_tuples = (LVDeadTuples *) palloc(SizeOfDeadTuples(maxtuples));
+		dead_tuples->num_tuples = 0;
+		dead_tuples->max_tuples = (int) maxtuples;
+
+		vacrel->deadtidstate->dead_tuples = dead_tuples;
+
+		ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
+		if (vacrel->rel->rd_rel->cbvacuumpage > oldest_pageno)
+			oldest_pageno = vacrel->rel->rd_rel->cbvacuumpage;
+
+		/*
+		 * TODO : compute how much space we need to load all the data from the
+		 * conveyor belt starting from oldest_pageno, if the data can fit
+		 * into the memory then we don't need to allocate the sort space.
+		 */
+
+		if ((next_pageno - oldest_pageno) * LV_CB_TID_PERPAGE < maintenance_work_mem)
+		{
+			/* Read dead tids from the dead tuple store. */
+			dead_tuples->num_tuples = lazy_get_deadtids(cb, oldest_pageno,
+													CB_INVALID_LOGICAL_PAGE,
+													dead_tuples->max_tuples,
+													dead_tuples->itemptrs,
+													&last_pageread);
+			Assert(last_pageread == next_pageno - 1);
+		}
+		/*
+		 * TODO, implement tuplesort
+		 * Read dead tuple from the conveyor belt and push it to to tuplesort.
+		 */
+		else
+		{
+			elog(ERROR, "feature is not yet implemented");
+
+			while(1)
+			{
+				/* Read dead tids from the dead tuple store. */
+				dead_tuples->num_tuples = lazy_get_deadtids(cb, oldest_pageno,
+														CB_INVALID_LOGICAL_PAGE,
+														dead_tuples->max_tuples,
+														dead_tuples->itemptrs,
+														&last_pageread);
+
+				/*** Insert the tuples in tuplesort ***/
+
+
+				/* Go to the next logical page. */
+				oldest_pageno = last_pageread + 1;
+			}
+		}
+
+	}
+
+	/*
+	 * If there is no sort space created, that means we already have all the
+	 * data in the cache so nothing to be done.  Otherwise check the cache and
+	 * reload the data from the tuplesort if required.
+	 */
+	if (vacrel->deadtidstate->sortstate == NULL)
+		return;
+	else
+	{
+		/* Pull more data from the tuplesort space.*/
+	}
+}
+
+/*
+ * lazy_check_deadtid -  check whether the tid already exist in deadtid fork.
+ */
+bool
+lazy_check_deadtid(LVRelState *vacrel, ItemPointerData *tid)
+{
+	LVDeadTuples   *dead_tuples;
+	int			low,
+				high,
+				mid,
+				res;
+
+	if (vacrel->deadtidstate == NULL)
+		return false;
+
+	dead_tuples = vacrel->deadtidstate->dead_tuples;
+
+	/* "high" is past end of posting list for loop invariant */
+	low = 0;
+	high = dead_tuples->num_tuples;
+	Assert(high >= low);
+
+	while (high > low)
+	{
+		mid = low + ((high - low) / 2);
+		res = ItemPointerCompare(tid, &dead_tuples->itemptrs[mid]);
+
+		if (res > 0)
+			low = mid + 1;
+		else if (res < 0)
+			high = mid;
+		else
+			return true;
+	}
+
+	return false;
+}
+
+/*
  *	index_vacuum() -- vacuum index relation.
  */
 void
@@ -3285,7 +3452,7 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 {
 	LVDeadTuples   *dead_tuples;
 	CBPageNo		start_pageno,
-					last_pageread;
+					last_pageread = CB_INVALID_LOGICAL_PAGE;
 	ConveyorBelt   *cb;
 	LVRelState		vacrel = {0};
 	IndexBulkDeleteResult *istat;
@@ -3358,7 +3525,9 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 	 * Set the conveyor belt pageno upto which we have already vacuumed so that
 	 * next time we can start vacuum from this point.
 	 */
-	UpdateRelationLastVaccumPage(RelationGetRelid(indrel), last_pageread + 1);
+	if (last_pageread != CB_INVALID_LOGICAL_PAGE)
+		UpdateRelationLastVaccumPage(RelationGetRelid(indrel),
+									 last_pageread + 1);
 
 	pgstat_progress_update_param(PROGRESS_VACUUM_NUM_INDEX_VACUUMS,
 								 vacrel.num_index_scans);
@@ -3379,7 +3548,7 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 }
 
 /*
- *	heap_vacuum_rel() -- perform pass2 VACUUM for one heap relation
+ *	lazy_vacuum_heap() -- perform pass2 VACUUM for one heap relation
  */
 static void
 lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
