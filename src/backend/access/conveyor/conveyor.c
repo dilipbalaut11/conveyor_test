@@ -990,7 +990,7 @@ void
 ConveyorBeltVacuum(ConveyorBelt *cb)
 {
 	Buffer		metabuffer;
-	BlockNumber	fsmblock = CONVEYOR_METAPAGE;
+	BlockNumber	fsmblock = InvalidBlockNumber;
 	Buffer		fsmbuffer = InvalidBuffer;
 	CBSegNo		cleared_segno = CB_INVALID_SEGMENT;
 	bool		needs_xlog;
@@ -1033,10 +1033,10 @@ ConveyorBeltVacuum(ConveyorBelt *cb)
 		 * segment.
 		 */
 		if ((obsolete_state != CBM_OBSOLETE_METAPAGE_ENTRIES ||
-			metapage_segno != cleared_segno) && fsmblock != CONVEYOR_METAPAGE)
+			metapage_segno != cleared_segno) && fsmblock != InvalidBlockNumber)
 		{
 			UnlockReleaseBuffer(fsmbuffer);
-			fsmblock = CONVEYOR_METAPAGE;
+			fsmblock = InvalidBlockNumber;
 			fsmbuffer = InvalidBuffer;
 		}
 
@@ -1088,9 +1088,7 @@ ConveyorBeltVacuum(ConveyorBelt *cb)
 				 * we must do this before relocking the metapage.
 				 */
 				fsmblock = ConveyorBeltFSMBlockNumber(cb, cleared_segno);
-				if (fsmblock == CONVEYOR_METAPAGE)
-					fsmbuffer = metabuffer;
-				else
+				if (fsmblock != InvalidBlockNumber)
 					fsmbuffer = ConveyorBeltRead(cb, fsmblock,
 												 BUFFER_LOCK_EXCLUSIVE);
 
@@ -1282,7 +1280,7 @@ ConveyorBeltExtend(ConveyorBelt *cb, BlockNumber blkno,
 /*
  * Figure out where the FSM bit for a given segment number is located.
  *
- * Returns CONVEYOR_METAPAGE if the segment's FSM bit is in the metapage,
+ * Returns InvalidBlockNumber if the segment's FSM bit is in the metapage,
  * or otherwise the block number of the FSM page that contains that FSM bit.
  */
 BlockNumber
@@ -1293,7 +1291,7 @@ ConveyorBeltFSMBlockNumber(ConveyorBelt *cb, CBSegNo segno)
 	unsigned	whichfsmpage;
 
 	if (segno < CB_FSM_SEGMENTS_FOR_METAPAGE)
-		return CONVEYOR_METAPAGE;
+		return InvalidBlockNumber;
 
 	firstblkno = cb_first_fsm_block(cb->cb_pages_per_segment);
 	stride = cb_fsm_block_spacing(cb->cb_pages_per_segment);
