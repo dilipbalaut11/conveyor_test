@@ -127,6 +127,7 @@ extern CBMInsertState cb_metapage_get_insert_state(CBMetapageData *meta,
 												   BlockNumber *blkno,
 												   CBPageNo *next_pageno,
 												   CBSegNo *next_segno,
+												   CBPageNo *index_start,
 												   CBPageNo *index_metapage_start,
 												   CBSegNo *newest_index_segment);
 extern void cb_metapage_advance_next_logical_page(CBMetapageData *meta,

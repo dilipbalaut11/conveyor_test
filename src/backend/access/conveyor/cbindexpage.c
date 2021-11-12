@@ -90,7 +90,7 @@ cb_indexpage_add_index_entries(Page page,
 	if (num_index_entries < 1 || num_index_entries > CB_INDEXPAGE_INDEX_ENTRIES)
 		elog(ERROR, "can't add %u index entries to an index page",
 			 num_index_entries);
-	if (pageoffset + num_index_entries >= CB_INDEXPAGE_INDEX_ENTRIES)
+	if (pageoffset + num_index_entries > CB_INDEXPAGE_INDEX_ENTRIES)
 		elog(ERROR, "can't place %u index entries starting at offset %u",
 			 num_index_entries, pageoffset);
 

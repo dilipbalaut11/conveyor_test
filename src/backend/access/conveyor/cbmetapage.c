@@ -135,10 +135,10 @@ cb_metapage_find_logical_page(CBMetapageData *meta,
  * Regardless of the return value, *next_pageno and *next_segno will be
  * set to the lowest-numbered logical page that is not allocated and the
  * lowest segment number that is not allocated, respectively. In addition,
- * *index_metapage_start will be set to the first logical page number
- * covered by the metapage portion of the index, and *newest_index_segment
- * will be set to the segment number of the newest index segment, or
- * CB_INVALID_SEGMENT if there is none.
+ * *index_start will be set to the first logical page number covered by the
+ * index, *index_metapage_start to the first logical page number covered by
+ * the metapage portion of the index, and *newest_index_segment to the segment
+ * number of the newest index segment, or CB_INVALID_SEGMENT if there is none.
  *
  * If the return value is CBM_INSERT_OK, *blkno will be set to the block number
  * of the first unused page in the unfilled payload segment.
@@ -152,6 +152,7 @@ cb_metapage_get_insert_state(CBMetapageData *meta,
 							 BlockNumber *blkno,
 							 CBPageNo *next_pageno,
 							 CBSegNo *next_segno,
+							 CBPageNo *index_start,
 							 CBPageNo *index_metapage_start,
 							 CBSegNo *newest_index_segment)
 {
@@ -162,6 +163,7 @@ cb_metapage_get_insert_state(CBMetapageData *meta,
 	/* Set the values that we return unconditionally. */
 	*next_pageno = meta->cbm_next_logical_page;
 	*next_segno = meta->cbm_next_segment;
+	*index_start = meta->cbm_index_start;
 	*index_metapage_start = meta->cbm_index_metapage_start;
 	*newest_index_segment = meta->cbm_newest_index_segment;
 
@@ -243,7 +245,8 @@ cb_metapage_advance_next_logical_page(CBMetapageData *meta,
 
 	/* Perform sanity checks. */
 	if (cb_metapage_get_insert_state(meta, &expected_blkno, &dummy_pageno,
-									 &dummy_segno, &dummy_pageno, &dummy_segno)
+									 &dummy_segno, &dummy_pageno,
+									 &dummy_pageno, &dummy_segno)
 		!= CBM_INSERT_OK)
 		elog(ERROR, "no active insertion segment");
 	if (blkno != expected_blkno)

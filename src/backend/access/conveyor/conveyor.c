@@ -181,7 +181,6 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	bool		needs_xlog;
 	int			mode = BUFFER_LOCK_SHARE;
 	int			iterations_without_next_pageno_change = 0;
-	unsigned	lppip;
 
 	/*
 	 * It would be really bad if someone called this function a second time
@@ -190,9 +189,6 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 	 */
 	Assert(!BufferIsValid(cb->cb_insert_metabuffer));
 	Assert(!BufferIsValid(cb->cb_insert_buffer));
-
-	/* Logical pages per index segment, and per index page. */
-	lppip = cb_logical_pages_per_index_page(cb->cb_pages_per_segment);
 
 	/* Do any changes we make here need to be WAL-logged? */
 	needs_xlog = RelationNeedsWAL(cb->cb_rel) || cb->cb_fork == INIT_FORKNUM;
@@ -238,6 +234,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		CBMetapageData *meta;
 		CBMInsertState insert_state;
 		BlockNumber next_blkno;
+		CBPageNo	index_start;
 		CBPageNo	index_metapage_start;
 		CBSegNo		newest_index_segment;
 		CBSegNo		next_segno;
@@ -263,6 +260,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 		meta = cb_metapage_get_special(BufferGetPage(metabuffer));
 		insert_state = cb_metapage_get_insert_state(meta, &next_blkno,
 													&next_pageno, &next_segno,
+													&index_start,
 													&index_metapage_start,
 													&newest_index_segment);
 
@@ -445,8 +443,20 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 			unsigned	num_index_entries;
 			CBSegNo	   *index_entries;
 			CBPageNo	index_page_start;
+			unsigned	logical_pages_in_index_segments;
+			unsigned	index_entries_in_index_segments;
 
-			pageoffset = index_metapage_start % lppip;
+			logical_pages_in_index_segments =
+				index_metapage_start - index_start;
+			if (logical_pages_in_index_segments % cb->cb_pages_per_segment != 0)
+				elog(ERROR, "index starts at " UINT64_FORMAT ", metapage index at " UINT64_FORMAT ", but there are %u pages per segment",
+					 index_start, index_metapage_start,
+					 cb->cb_pages_per_segment);
+			index_entries_in_index_segments =
+				logical_pages_in_index_segments / cb->cb_pages_per_segment;
+			pageoffset =
+				index_entries_in_index_segments % CB_INDEXPAGE_INDEX_ENTRIES;
+
 			num_index_entries = Min(CB_METAPAGE_INDEX_ENTRIES,
 									CB_INDEXPAGE_INDEX_ENTRIES - pageoffset);
 			index_entries = cb_metapage_get_index_entry_pointer(meta);
