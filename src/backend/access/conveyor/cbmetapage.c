@@ -397,10 +397,9 @@ cb_metapage_remove_index_entries(CBMetapageData *meta, unsigned count,
 	meta->cbm_index_metapage_start +=
 		count * meta->cbm_pages_per_segment;
 	if (relocating)
-	{
-		meta->cbm_index_start = meta->cbm_index_metapage_start;
 		meta->cbm_entries_in_newest_index_segment += count;
-	}
+	else
+		meta->cbm_index_start = meta->cbm_index_metapage_start;
 }
 
 /*
