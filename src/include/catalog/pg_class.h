@@ -129,7 +129,7 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 	TransactionId relminmxid BKI_DEFAULT(1);	/* FirstMultiXactId */
 
 	/* conveyor belt pageno upto which we have already vacuumed. */
-	int64		cbvacuumpage BKI_DEFAULT(0);
+	int64		cbvacuumpage BKI_DEFAULT(-1);
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* NOTE: These fields are not present in a relcache entry's rd_rel field. */
