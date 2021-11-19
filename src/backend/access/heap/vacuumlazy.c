@@ -323,7 +323,8 @@ typedef struct LVDeadTidForkState
 {
 	ConveyorBelt   *cb;				/* Conveyor belt reference.*/
 	LVDeadTuples   *dead_tuples;	/* Conveyor belt dead tuple cache. */
-	Tuplesortstate *sortstate;		/* state data for tuplesort.c */
+	CBPageNo	   *next_run_page;	/* Next cbpageno for each run. */
+	int				nCacheBlockPerRun; /* Computed from cache size and runs. */ 
 } LVDeadTidForkState;
 
 typedef struct LVRelState
@@ -1421,10 +1422,9 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 		}
 
 		/*
-		 * If we are doing the first pass only then before calling prune for
-		 * new block ensure that the dead tids from from dead tid fork is
-		 * already in the cache, so that we can avoid adding the duplicate
-		 * tids.
+		 * If we are doing the first pass then before calling prune for new
+		 * block ensure that the dead tids from from dead tid fork is already
+		 * in the cache, so that we can avoid adding the duplicate tids.
 		 */
 		if (params->options & VACOPT_FIRST_PASS)
 			lazy_load_deadtids(vacrel, blkno);
@@ -3315,6 +3315,9 @@ lazy_read_deadtids(ConveyorBelt *cb, CBPageNo from_pageno,
 
 /*
  * lazy_load_deadtids - load deadtid from conveyor belt into the cache.
+ *
+ * TODO: Currently, using complete maintenance_work_mem for simplicity, but
+ * later we need to divide this memory between the cache and the new dead tids.
  */
 static void
 lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
@@ -3329,7 +3332,7 @@ lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
 	if (!smgrexists(reln, DEADTID_FORKNUM))
 		return;
 
-	/* If deadtidstate is not yeat allocated then allocate it now. */
+	/* If deadtidstate is not yet allocated then allocate it now. */
 	if (vacrel->deadtidstate == NULL)
 	{
 		ConveyorBelt   *cb;
@@ -3344,7 +3347,7 @@ lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
 														 CurrentMemoryContext);
 
 		/*
-		 * FIXME: instead of using complete maintenance_work_mem, we need to
+		 * TODO: instead of using complete maintenance_work_mem, we need to
 		 * divide this between the cache and the new deadtids.  maybe we can
 		 * leave some space for new deadtids, and when that is full we can
 		 * flush that out to the conveyor belt.
@@ -3362,12 +3365,10 @@ lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
 			oldest_pageno = vacrel->rel->rd_rel->cbvacuumpage;
 
 		/*
-		 * TODO : compute how much space we need to load all the data from the
-		 * conveyor belt starting from oldest_pageno, if the data can fit
-		 * into the memory then we don't need to allocate the sort space.
+		 * If we can load all the deadtids in the cache then read all the tids
+		 * directly into the cache, and sort them. 		 
 		 */
-
-		if ((next_pageno - oldest_pageno) * MaxDeadTidsPerCBPage < maintenance_work_mem)
+		if ((next_pageno - oldest_pageno) * MaxDeadTidsPerCBPage <= maxtuples)
 		{
 			/* Read dead tids from the dead tuple store. */
 			dead_tuples->num_tuples = lazy_read_deadtids(cb, oldest_pageno,
@@ -3376,30 +3377,61 @@ lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
 													dead_tuples->itemptrs,
 													&last_pageread);
 			Assert(last_pageread == next_pageno - 1);
+
+			/* TODO sort the dead_tuples array. */
 		}
 		/*
-		 * TODO, implement tuplesort
-		 * Read dead tuple from the conveyor belt and push it to to tuplesort.
+		 * Compute the number of runs available in the conveyor belt and check
+		 * whether we have enough cache to load at least one block from each
+		 * run, if so then we can peroform in-memory merge of the runs.
 		 */
 		else
 		{
-			elog(ERROR, "feature is not yet implemented");
+			int			maxCacheBlock;
+			int			nRunCount = 0;
+			Buffer		buffer;
+			CBPageNo	curpageno = oldest_pageno;
+			LVDeadTidForkState	*deadtidstate = vacrel->deadtidstate;
 
+			elog(ERROR, "conveyor belt run-merge is not yet implemented");
+
+			/* Compute the number of blocks we can load in the cache. */
+			maxCacheBlock = maxtuples/MaxDeadTidsPerCBPage;
+
+			/* 
+			 * Allocate next_run_page, this will hold the next page to load
+			 * from each run.
+			 */
+			deadtidstate->next_run_page =
+					palloc(maxCacheBlock * sizeof(CBPageNo));
+
+			/* Read page from the conveyor belt. */
 			while(1)
 			{
-				/* Read dead tids from the dead tuple store. */
-				dead_tuples->num_tuples = lazy_read_deadtids(cb, oldest_pageno,
-														CB_INVALID_LOGICAL_PAGE,
-														dead_tuples->max_tuples,
-														dead_tuples->itemptrs,
-														&last_pageread);
+				buffer = ConveyorBeltReadBuffer(cb, curpageno,
+												BUFFER_LOCK_SHARE, NULL);
 
-				/*** Insert the tuples in tuplesort ***/
-
-
-				/* Go to the next logical page. */
-				oldest_pageno = last_pageread + 1;
+				/* TODO: From pageheader get the nextrun start page. */
+				if (/*phdr->nextpageno*/curpageno != CB_INVALID_LOGICAL_PAGE)
+				{
+					deadtidstate->next_run_page[nRunCount++] = curpageno;
+					curpageno = curpageno; /* FIXME phdr->nextpageno */
+				}
+				else
+					break;
 			}
+
+			/*
+			 * If the total numbers of run in the conveyor belt is less than
+			 * the max cache block available then we can perform in-memory
+			 * merge of all the run, otherwise we have to perform disk based
+			 * merge.
+			 */
+			if (nRunCount < maxCacheBlock)
+			{
+
+			}
+
 		}
 
 	}
@@ -3409,11 +3441,11 @@ lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
 	 * data in the cache so nothing to be done.  Otherwise check the cache and
 	 * reload the data from the tuplesort if required.
 	 */
-	if (vacrel->deadtidstate->sortstate == NULL)
+	if (vacrel->deadtidstate->next_run_page == NULL)
 		return;
 	else
 	{
-		/* Pull more data from the tuplesort space.*/
+		/* load next set of blocks from each runs.*/
 	}
 }
 
