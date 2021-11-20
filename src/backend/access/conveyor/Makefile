@@ -19,7 +19,6 @@ OBJS = \
 	cbmetapage.o \
 	cbmodify.o \
 	cbxlog.o \
-	conveyor.o \
-	deadtidstore.o
+	conveyor.o
 
 include $(top_srcdir)/src/backend/common.mk

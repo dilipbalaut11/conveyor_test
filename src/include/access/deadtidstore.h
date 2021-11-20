@@ -18,9 +18,21 @@
 #include "storage/itemptr.h"
 #include "utils/relcache.h"
 
-extern void DTS_AppendTid(Relation rel, int ntids, ItemPointerData *deadtids);
-extern int DTS_ReadDeadTids(Relation rel, CBPageNo start_pageno, int maxtids,
-				 ItemPointerData *deadtids, CBPageNo *last_pageread);
+struct DTS_DeadTidState;
+typedef struct DTS_DeadTidState DTS_DeadTidState;
 
+extern DTS_DeadTidState *DTS_InitDeadTidState(Relation rel);
+extern void DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, int ntids,
+							   ItemPointerData *deadtids);
+extern int DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate,
+							CBPageNo from_pageno, CBPageNo to_pageno,
+							int maxtids, ItemPointerData *deadtids,
+							CBPageNo *last_pageread);
+extern void DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
+							 int maxtids);
+extern bool DTS_DeadtidExists(DTS_DeadTidState *deadtidstate,
+							  ItemPointerData *tid);
+extern void DTS_SetNextRunpage(DTS_DeadTidState	*deadtidstate);
+extern void DTS_Vacuum(DTS_DeadTidState	*deadtidstate, CBPageNo	pageno);
 
 #endif							/* DEADTIDSTORE_H */

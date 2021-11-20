@@ -316,17 +316,6 @@ typedef struct LVParallelState
 	int			nindexes_parallel_condcleanup;
 } LVParallelState;
 
-/*
- * Dead tid fork state.
- */
-typedef struct LVDeadTidForkState
-{
-	ConveyorBelt   *cb;				/* Conveyor belt reference.*/
-	LVDeadTuples   *dead_tuples;	/* Conveyor belt dead tuple cache. */
-	CBPageNo	   *next_run_page;	/* Next cbpageno for each run. */
-	int				nCacheBlockPerRun; /* Computed from cache size and runs. */ 
-} LVDeadTidForkState;
-
 typedef struct LVRelState
 {
 	/* Target heap relation and its indexes */
@@ -396,7 +385,7 @@ typedef struct LVRelState
 	int64		live_tuples;	/* live tuples (reltuples estimate) */
 
 	/* dead tid fork state */
-	LVDeadTidForkState	*deadtidstate;
+	DTS_DeadTidState *deadtidstate;
 } LVRelState;
 
 /*
@@ -496,14 +485,6 @@ static void update_vacuum_error_info(LVRelState *vacrel,
 									 OffsetNumber offnum);
 static void restore_vacuum_error_info(LVRelState *vacrel,
 									  const LVSavedErrInfo *saved_vacrel);
-static void lazy_insert_deadtids(Relation rel, int ntids,
-							  ItemPointerData *deadtids);
-static int lazy_read_deadtids(ConveyorBelt *cb, CBPageNo from_pageno,
-							 CBPageNo to_pageno, int maxtids,
-							 ItemPointerData *deadtids,
-							 CBPageNo *last_pageread);
-static void lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno);
-bool lazy_check_deadtid(LVRelState *vacrel, ItemPointerData *tid);
 static void lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params);
 static void UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno);
 
@@ -1004,6 +985,10 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	vacrel->indstats = (IndexBulkDeleteResult **)
 		palloc0(vacrel->nindexes * sizeof(IndexBulkDeleteResult *));
 
+	/* Initialize deadtid state if doing only first pass vacuum. */
+	if (params->options & VACOPT_FIRST_PASS)
+		vacrel->deadtidstate = DTS_InitDeadTidState(vacrel->rel);
+
 	/*
 	 * Before beginning scan, check if it's already necessary to apply
 	 * failsafe
@@ -1236,8 +1221,9 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 			 * storage can be used by other vacuum cycle.
 			 */
 			if (params->options & VACOPT_FIRST_PASS)
-				lazy_insert_deadtids(vacrel->rel, vacrel->dead_tuples->num_tuples,
-								  vacrel->dead_tuples->itemptrs);
+				DTS_InsertDeadtids(vacrel->deadtidstate,
+								   vacrel->dead_tuples->num_tuples,
+								   vacrel->dead_tuples->itemptrs);
 			else
 				lazy_vacuum(vacrel);
 
@@ -1427,7 +1413,12 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 		 * in the cache, so that we can avoid adding the duplicate tids.
 		 */
 		if (params->options & VACOPT_FIRST_PASS)
-			lazy_load_deadtids(vacrel, blkno);
+		{
+			long	maxtids;
+
+			maxtids = compute_max_dead_tuples(InvalidBlockNumber, true);
+			DTS_LoadDeadtids(vacrel->deadtidstate, blkno, maxtids / 2);
+		}
 
 		/*
 		 * Prune and freeze tuples.
@@ -1666,11 +1657,16 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 		 * storage can be used by other vacuum cycle.
 		 */
 		if (params->options & VACOPT_FIRST_PASS)
-			lazy_insert_deadtids(vacrel->rel, vacrel->dead_tuples->num_tuples,
-							 vacrel->dead_tuples->itemptrs);
+			DTS_InsertDeadtids(vacrel->deadtidstate,
+							   vacrel->dead_tuples->num_tuples,
+							   vacrel->dead_tuples->itemptrs);
 		else
 			lazy_vacuum(vacrel);
 	}
+
+	/* First pass is complete so set the next run page. */
+	if (params->options & VACOPT_FIRST_PASS)
+		DTS_SetNextRunpage(vacrel->deadtidstate);
 
 	/*
 	 * Vacuum the remainder of the Free Space Map.  We must do this whether or
@@ -2123,7 +2119,7 @@ retry:
 		for (int i = 0; i < lpdead_items; i++)
 		{
 			ItemPointerSetOffsetNumber(&tmp, deadoffsets[i]);
-			if (!lazy_check_deadtid(vacrel, &tmp))
+			if (!DTS_DeadtidExists(vacrel->deadtidstate, &tmp))
 				dead_tuples->itemptrs[dead_tuples->num_tuples++] = tmp;
 		}
 
@@ -3166,328 +3162,6 @@ UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno)
 }
 
 /*
- *	lazy_insert_deadtids() -- Insert given deadtids into the conveyor belt
- */
-void
-lazy_insert_deadtids(Relation rel, int ntids, ItemPointerData *deadtids)
-{
-	ConveyorBelt   *cb;
-	SMgrRelation	reln;
-
-	/* Open the relation at smgr level. */
-	reln = RelationGetSmgr(rel);
-
-	/*
-	 * If the dead_tid fork doesn't exist then create it and initialize the
-	 * conveyor belt, otherwise just open the conveyor belt.
-	 */
-	if (!smgrexists(reln, DEADTID_FORKNUM))
-	{
-		smgrcreate(reln, DEADTID_FORKNUM, false);
-		cb = ConveyorBeltInitialize(rel,
-									DEADTID_FORKNUM,
-									1024,	/* What is the best value ?*/
-									CurrentMemoryContext);
-	}
-	else
-		cb = ConveyorBeltOpen(rel, DEADTID_FORKNUM, CurrentMemoryContext);
-
-	/* Loop until we flush out all the dead tids in the conveyor belt. */
-	while(ntids > 0)
-	{
-		Buffer	buffer;
-		Page	page;
-		char   *pagedata;
-		int		count;
-		PageHeader	phdr;
-		CBPageNo	pageno;
-
-		/* Get a new page from the ConveyorBelt. */
-		buffer = ConveyorBeltGetNewPage(cb, &pageno);
-		page = BufferGetPage(buffer);
-		PageInit(page, BLCKSZ, 0);
-		phdr = (PageHeader) page;
-		pagedata = PageGetContents(page);
-
-		/* Compute how many dead tids we can store into this page. */
-		count =  Min(MaxDeadTidsPerCBPage, ntids);
-
-		START_CRIT_SECTION();
-		/*
-		 * Copy the data into the page and set the pd_lower.  We are just
-		 * copying ItemPointerData array so we don't need any alignment which
-		 * should be SHORTALIGN and sizeof(ItemPointerData) will take care of
-		 * that so we don't need any other alignment.
-		 */
-		memcpy(pagedata, deadtids, sizeof(ItemPointerData) * count);
-		phdr->pd_lower += sizeof(ItemPointerData) * count;
-		ConveyorBeltPerformInsert(cb, buffer);
-
-		END_CRIT_SECTION();
-
-		ConveyorBeltCleanupInsert(cb, buffer);
-
-		/* Adjust deadtid pointer and the remaining tid count. */
-		deadtids += count;
-		ntids -= count;
-	}
-}
-
-/*
- * lazy_read_deadtids - Read dead tids from the conveyor belt
- *
- * from_pageno - Conveyor belt page number from where we want to start
- * to_pageno - Conveyor belt page number upto which we want to read
- * deadtids - Pre allocated array for holding the dead tids, the allocated size
- * is sufficient to hold maxtids.
- * *last_pageread - Store last page number we have read from coveyor belt.
- *
- * Returns number of dead tids actually read from the conveyor belt.  Should
- * always be <= maxtids.
- */
-static int
-lazy_read_deadtids(ConveyorBelt *cb, CBPageNo from_pageno,
-				  CBPageNo to_pageno, int maxtids, ItemPointerData *deadtids,
-				  CBPageNo *last_pageread)
-{
-	Page			page;
-	Buffer			buffer;
-	CBPageNo		oldest_pageno;
-	CBPageNo		next_pageno;
-	int				count;
-	int				ndeadtids = 0;
-	int				prevpageno = from_pageno;
-
-	/* Read the conveyor belt bounds and check page validity. */
-	ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
-	if (from_pageno >= next_pageno)
-		return 0;
-
-	Assert(from_pageno >= oldest_pageno &&
-		   (to_pageno == CB_INVALID_LOGICAL_PAGE || to_pageno <= next_pageno));
-
-	/*
-	 * If caller has passed a valid to_pageno then don't try to read beyond
-	 * that.
-	 */
-	if (to_pageno != CB_INVALID_LOGICAL_PAGE && to_pageno < next_pageno)
-		next_pageno = to_pageno;
-
-	/* Loop until we read maxtids. */
-	while(ndeadtids < maxtids && from_pageno < next_pageno)
-	{
-		/* Read page from the conveyor belt. */
-		buffer = ConveyorBeltReadBuffer(cb, from_pageno, BUFFER_LOCK_SHARE,
-										NULL);
-		if (BufferIsInvalid(buffer))
-			break;
-
-		page = BufferGetPage(buffer);
-		count = CBPageDeadTidsCount(page);
-
-		/*
-		 * Don't stop reading in middle of the page, so if remaning tids to
-		 * read are less than the tid in this page then stop here.
-		 */
-		if (maxtids - ndeadtids < count)
-			break;
-
-		/* Read data into the deadtid buffer. */
-		memcpy(deadtids + ndeadtids, PageGetContents(page),
-			   sizeof(ItemPointerData) * count);
-		UnlockReleaseBuffer(buffer);
-
-		/* 
-		 * Update the deadtid count we read and remember the previous last
-		 * conveyor belt page we read.
-		 */
-		ndeadtids += count;
-		prevpageno = from_pageno;
-
-		/* Go to the next page. */
-		from_pageno++;
-	}
-
-	*last_pageread = prevpageno;
-
-	return ndeadtids;
-}
-
-/*
- * lazy_load_deadtids - load deadtid from conveyor belt into the cache.
- *
- * TODO: Currently, using complete maintenance_work_mem for simplicity, but
- * later we need to divide this memory between the cache and the new dead tids.
- */
-static void
-lazy_load_deadtids(LVRelState *vacrel, BlockNumber blkno)
-{
-	SMgrRelation	reln;
-	LVDeadTuples   *dead_tuples;
-
-	/* Open the relation at smgr level. */
-	reln = RelationGetSmgr(vacrel->rel);
-
-	/* If the dead_tid fork doesn't exist then nothing to do. */
-	if (!smgrexists(reln, DEADTID_FORKNUM))
-		return;
-
-	/* If deadtidstate is not yet allocated then allocate it now. */
-	if (vacrel->deadtidstate == NULL)
-	{
-		ConveyorBelt   *cb;
-		CBPageNo		oldest_pageno;
-		CBPageNo		next_pageno;
-		CBPageNo		last_pageread;
-		long			maxtuples;
-
-		vacrel->deadtidstate = palloc0(sizeof(LVDeadTidForkState));
-		vacrel->deadtidstate->cb = cb = ConveyorBeltOpen(vacrel->rel,
-														 DEADTID_FORKNUM,
-														 CurrentMemoryContext);
-
-		/*
-		 * TODO: instead of using complete maintenance_work_mem, we need to
-		 * divide this between the cache and the new deadtids.  maybe we can
-		 * leave some space for new deadtids, and when that is full we can
-		 * flush that out to the conveyor belt.
-		 */
-		maxtuples = compute_max_dead_tuples(InvalidBlockNumber, true);
-
-		dead_tuples = (LVDeadTuples *) palloc(SizeOfDeadTuples(maxtuples));
-		dead_tuples->num_tuples = 0;
-		dead_tuples->max_tuples = (int) maxtuples;
-
-		vacrel->deadtidstate->dead_tuples = dead_tuples;
-
-		ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
-		if (vacrel->rel->rd_rel->cbvacuumpage > oldest_pageno)
-			oldest_pageno = vacrel->rel->rd_rel->cbvacuumpage;
-
-		/*
-		 * If we can load all the deadtids in the cache then read all the tids
-		 * directly into the cache, and sort them. 		 
-		 */
-		if ((next_pageno - oldest_pageno) * MaxDeadTidsPerCBPage <= maxtuples)
-		{
-			/* Read dead tids from the dead tuple store. */
-			dead_tuples->num_tuples = lazy_read_deadtids(cb, oldest_pageno,
-													CB_INVALID_LOGICAL_PAGE,
-													dead_tuples->max_tuples,
-													dead_tuples->itemptrs,
-													&last_pageread);
-			Assert(last_pageread == next_pageno - 1);
-
-			/* TODO sort the dead_tuples array. */
-		}
-		/*
-		 * Compute the number of runs available in the conveyor belt and check
-		 * whether we have enough cache to load at least one block from each
-		 * run, if so then we can peroform in-memory merge of the runs.
-		 */
-		else
-		{
-			int			maxCacheBlock;
-			int			nRunCount = 0;
-			Buffer		buffer;
-			CBPageNo	curpageno = oldest_pageno;
-			LVDeadTidForkState	*deadtidstate = vacrel->deadtidstate;
-
-			elog(ERROR, "conveyor belt run-merge is not yet implemented");
-
-			/* Compute the number of blocks we can load in the cache. */
-			maxCacheBlock = maxtuples/MaxDeadTidsPerCBPage;
-
-			/* 
-			 * Allocate next_run_page, this will hold the next page to load
-			 * from each run.
-			 */
-			deadtidstate->next_run_page =
-					palloc(maxCacheBlock * sizeof(CBPageNo));
-
-			/* Read page from the conveyor belt. */
-			while(1)
-			{
-				buffer = ConveyorBeltReadBuffer(cb, curpageno,
-												BUFFER_LOCK_SHARE, NULL);
-
-				/* TODO: From pageheader get the nextrun start page. */
-				if (/*phdr->nextpageno*/curpageno != CB_INVALID_LOGICAL_PAGE)
-				{
-					deadtidstate->next_run_page[nRunCount++] = curpageno;
-					curpageno = curpageno; /* FIXME phdr->nextpageno */
-				}
-				else
-					break;
-			}
-
-			/*
-			 * If the total numbers of run in the conveyor belt is less than
-			 * the max cache block available then we can perform in-memory
-			 * merge of all the run, otherwise we have to perform disk based
-			 * merge.
-			 */
-			if (nRunCount < maxCacheBlock)
-			{
-
-			}
-
-		}
-
-	}
-
-	/*
-	 * If there is no sort space created, that means we already have all the
-	 * data in the cache so nothing to be done.  Otherwise check the cache and
-	 * reload the data from the tuplesort if required.
-	 */
-	if (vacrel->deadtidstate->next_run_page == NULL)
-		return;
-	else
-	{
-		/* load next set of blocks from each runs.*/
-	}
-}
-
-/*
- * lazy_check_deadtid -  check whether the tid already exist in deadtid fork.
- */
-bool
-lazy_check_deadtid(LVRelState *vacrel, ItemPointerData *tid)
-{
-	LVDeadTuples   *dead_tuples;
-	int			low,
-				high,
-				mid,
-				res;
-
-	if (vacrel->deadtidstate == NULL)
-		return false;
-
-	dead_tuples = vacrel->deadtidstate->dead_tuples;
-
-	/* "high" is past end of posting list for loop invariant */
-	low = 0;
-	high = dead_tuples->num_tuples;
-	Assert(high >= low);
-
-	while (high > low)
-	{
-		mid = low + ((high - low) / 2);
-		res = ItemPointerCompare(tid, &dead_tuples->itemptrs[mid]);
-
-		if (res > 0)
-			low = mid + 1;
-		else if (res < 0)
-			high = mid;
-		else
-			return true;
-	}
-
-	return false;
-}
-
-/*
  *	index_vacuum() -- vacuum index relation.
  */
 void
@@ -3497,9 +3171,9 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 	LVDeadTuples   *dead_tuples;
 	CBPageNo		start_pageno,
 					last_pageread = CB_INVALID_LOGICAL_PAGE;
-	ConveyorBelt   *cb;
 	LVRelState		vacrel = {0};
-	IndexBulkDeleteResult *istat;
+	DTS_DeadTidState	   *dts;
+	IndexBulkDeleteResult  *istat;
 	ErrorContextCallback errcallback;
 
 	/* Initialize vacuum rel state. */
@@ -3539,8 +3213,8 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 	if (start_pageno == CB_INVALID_LOGICAL_PAGE)
 		start_pageno = 0;
 
-	/* Open the conveyor belt. */
-	cb = ConveyorBeltOpen(heaprel, DEADTID_FORKNUM, CurrentMemoryContext);
+	/* Initialize deadtid state. */
+	dts = DTS_InitDeadTidState(heaprel);
 
 	/*
 	 * Loop until we complete the index vacuum.  Read tuples which can fit into
@@ -3550,11 +3224,11 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 	while(1)
 	{
 		/* Read dead tids from the dead tuple store. */
-		dead_tuples->num_tuples = lazy_read_deadtids(cb, start_pageno,
-													 CB_INVALID_LOGICAL_PAGE,
-													 dead_tuples->max_tuples,
-													 dead_tuples->itemptrs,
-													 &last_pageread);
+		dead_tuples->num_tuples = DTS_ReadDeadtids(dts, start_pageno,
+												   CB_INVALID_LOGICAL_PAGE,
+												   dead_tuples->max_tuples,
+												   dead_tuples->itemptrs,
+												   &last_pageread);
 
 		/* No more dead tuples so we are done. */
 		if (dead_tuples->num_tuples == 0)
@@ -3603,8 +3277,8 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	CBPageNo	to_pageno = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	last_pageread;
 	int			i;
-	LVDeadTuples   *dead_tuples;
-	ConveyorBelt   *cb;
+	LVDeadTuples	   *dead_tuples;
+	DTS_DeadTidState   *dts;
 
 	/* Initialize vacuum rel state. */
 	lazy_init_vacrel(vacrel, RelationGetNumberOfBlocks(vacrel->rel));
@@ -3633,18 +3307,19 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	if (from_pageno == CB_INVALID_LOGICAL_PAGE)
 		from_pageno = 0;
 
-	/* Open the conveyor belt. */
-	cb = ConveyorBeltOpen(vacrel->rel, DEADTID_FORKNUM, CurrentMemoryContext);
+	/* Initialize deadtid state. */
+	dts = DTS_InitDeadTidState(vacrel->rel);
 
 	/* Loop until we complete the heap vacuum. */
 	while(from_pageno < to_pageno)
 	{
 		/* Read dead tids from the conveyor belt. */
-		dead_tuples->num_tuples = lazy_read_deadtids(cb, from_pageno,
-													to_pageno,
-													dead_tuples->max_tuples,
-													dead_tuples->itemptrs,
-													&last_pageread);
+		dead_tuples->num_tuples = DTS_ReadDeadtids(dts, from_pageno,
+												   to_pageno,
+												   dead_tuples->max_tuples,
+												   dead_tuples->itemptrs,
+												   &last_pageread);
+
 		/* No more dead tids, we are done. */
 		if (dead_tuples->num_tuples == 0)
 			break;
@@ -3663,11 +3338,8 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	UpdateRelationLastVaccumPage(RelationGetRelid(vacrel->rel),
 								 last_pageread + 1);
 
-	/* Truncate the conveyor belt pages which we have already processed. */
-	ConveyorBeltLogicalTruncate(cb, to_pageno);
-
-	/* Vacuum the conveyor belt. */
-	ConveyorBeltVacuum(cb);
+	/* Vacuum the dead tid store. */
+	DTS_Vacuum(dts, to_pageno);
 
 	/* Cleanup */
 	lazy_space_free(vacrel);
