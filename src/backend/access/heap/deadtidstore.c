@@ -27,8 +27,12 @@
 struct DTS_DeadTidState
 {
 	ConveyorBelt   *cb;					/* conveyor belt reference.*/
+
+	/* Members for tracking the current run. */
 	CBPageNo		start_page;			/* start page for this run. */
 	CBPageNo		last_page;			/* last page for this run. */
+
+	/* Memebers for maintaining the cache over runs for duplicate check. */
 	int				num_tids;			/* number of of dead tids. */
 	ItemPointerData   *itemptrs;		/* dead tid cache. */
 	int				num_runs;			/* number of runs in conveyor belt. */	
@@ -38,23 +42,22 @@ struct DTS_DeadTidState
 };
 
 /* Next run page number in the special space. */
-typedef struct DTSPageData
+typedef struct DTS_PageData
 {
 	CBPageNo	nextrunpage;
-} DTSPageData;
+} DTS_PageData;
 
 /* Max dead tids per conveyor belt page. */
-#define MaxDeadTidsPerCBPage \
-	(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(DTSPageData)) / sizeof(ItemPointerData)
+#define DTS_MaxTidsPerPage \
+	(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(DTS_PageData)) / sizeof(ItemPointerData)
 
 /* Compute the number of deadtids in given conveyor belt page. */
-#define CBPageDeadTidsCount(page) \
+#define DTS_TidsInPage(page) \
 	(((PageHeader) (page))->pd_lower -  MAXALIGN(SizeOfPageHeaderData)) / sizeof(ItemPointerData)
-
-#define MAXDEADTUPLES(max_size) (max_size) / sizeof(ItemPointerData))
 
 /* non-export function prototypes */
 static void dts_page_init(Page page);
+static int32 dts_tidcmp(const void *a, const void *b);
 static void dts_merge_runs(DTS_DeadTidState *deadtidstate);
 
 /*
@@ -63,11 +66,23 @@ static void dts_merge_runs(DTS_DeadTidState *deadtidstate);
 static void
 dts_page_init(Page page)
 {
-	DTSPageData	   *deadtidpd;
+	DTS_PageData	   *deadtidpd;
 
-	PageInit(page, BLCKSZ, sizeof(DTSPageData));
-	deadtidpd = (DTSPageData *) PageGetSpecialPointer(page);
+	PageInit(page, BLCKSZ, sizeof(DTS_PageData));
+	deadtidpd = (DTS_PageData *) PageGetSpecialPointer(page);
 	deadtidpd->nextrunpage = CB_INVALID_LOGICAL_PAGE;
+}
+
+/*
+ * dts_tidcmp() - Compare two item pointers, return -1, 0, or +1.
+ */
+static int32
+dts_tidcmp(const void *a, const void *b)
+{
+	ItemPointer iptr1 = ((const ItemPointer) a);
+	ItemPointer iptr2 = ((const ItemPointer) b);
+
+	return ItemPointerCompare(iptr1, iptr2);
 }
 
 /*
@@ -90,40 +105,48 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 	ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
 	curpageno = oldest_pageno;
 
+
 	/* Compute the number of blocks we can load in the cache. */
-	maxCacheBlock = deadtidstate->max_tids / MaxDeadTidsPerCBPage;
+	maxCacheBlock = deadtidstate->max_tids / DTS_MaxTidsPerPage;
 
-	/* 
-	 * Allocate next_run_page, this will hold the next page to load from each
-	 * run.
-	 */
-	deadtidstate->next_run_page = palloc(maxCacheBlock * sizeof(CBPageNo));
-
-	/* Read page from the conveyor belt. */
-	while(1)
+	if (deadtidstate->next_run_page)
 	{
-		DTSPageData *deadtidpd;
-		Buffer	buffer;
-		Page	page;
+		/* 
+		* Allocate next_run_page, this will hold the next page to load from each
+		* run.
+		*/
+		deadtidstate->next_run_page = palloc(maxCacheBlock * sizeof(CBPageNo));
 
 		/* Read page from the conveyor belt. */
-		buffer = ConveyorBeltReadBuffer(cb, curpageno,
-										BUFFER_LOCK_SHARE, NULL);
-		if (BufferIsInvalid(buffer))
-			elog(ERROR, "invalid conveyor belt page" UINT64_FORMAT, curpageno);
-
-		page = BufferGetPage(buffer);
-		deadtidpd = (DTSPageData *) PageGetSpecialPointer(page);
-
-		/* If nextrun page is set then go to the next run. */
-		if (deadtidpd->nextrunpage != CB_INVALID_LOGICAL_PAGE)
+		while(1)
 		{
-			deadtidstate->next_run_page[nRunCount++] = curpageno;
-			curpageno = deadtidpd->nextrunpage;
+			DTS_PageData *deadtidpd;
+			Buffer	buffer;
+			Page	page;
+
+			/* Read page from the conveyor belt. */
+			buffer = ConveyorBeltReadBuffer(cb, curpageno,
+											BUFFER_LOCK_SHARE, NULL);
+			if (BufferIsInvalid(buffer))
+				elog(ERROR, "invalid conveyor belt page" UINT64_FORMAT, curpageno);
+
+			page = BufferGetPage(buffer);
+			deadtidpd = (DTS_PageData *) PageGetSpecialPointer(page);
+
+			/* If nextrun page is set then go to the next run. */
+			if (deadtidpd->nextrunpage != CB_INVALID_LOGICAL_PAGE)
+			{
+				deadtidstate->next_run_page[nRunCount++] = curpageno;
+				curpageno = deadtidpd->nextrunpage;
+			}
+			else
+				break;
 		}
-		else
-			break;
+		deadtidstate->num_runs = nRunCount;
 	}
+	else
+		nRunCount = deadtidstate->num_runs;
+	
 
 	/*
 	 * If the total numbers of run in the conveyor belt is less than
@@ -133,7 +156,24 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 	 */
 	if (nRunCount < maxCacheBlock)
 	{
+		int			nrun;
+		int			nBlockPerRun = maxCacheBlock / nRunCount;
+		int			ntidpertun = deadtidstate->max_tids / nRunCount;
+		CBPageNo	lastpage;
+		ItemPointerData   *itemptrs;
+	
+		itemptrs = palloc0(deadtidstate->max_tids * sizeof(ItemPointerData));
 
+		for (nrun = 0; nrun < nRunCount; nrun++)
+		{
+			CBPageNo	from_page = deadtidstate->next_run_page[nrun];
+			CBPageNo	to_page = from_page + nBlockPerRun;
+
+			DTS_ReadDeadtids(deadtidstate, from_page, to_page,
+							 deadtidstate->max_tids, itemptrs,
+							 lastpage);
+			itemptrs += ntidpertun;
+		}
 	}
 }
 
@@ -205,7 +245,7 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, int ntids,
 		pagedata = PageGetContents(page);
 
 		/* Compute how many dead tids we can store into this page. */
-		count =  Min(MaxDeadTidsPerCBPage, ntids);
+		count =  Min(DTS_MaxTidsPerPage, ntids);
 
 		START_CRIT_SECTION();
 		/*
@@ -285,7 +325,7 @@ DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate, CBPageNo from_pageno,
 			break;
 
 		page = BufferGetPage(buffer);
-		count = CBPageDeadTidsCount(page);
+		count = DTS_TidsInPage(page);
 
 		/*
 		 * Don't stop reading in middle of the page, so if remaning tids to
@@ -353,7 +393,7 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 		 * If we can load all the deadtids in the cache then read all the tids
 		 * directly into the cache, and sort them. 		 
 		 */
-		if ((next_pageno - oldest_pageno) * MaxDeadTidsPerCBPage <= maxtids)
+		if ((next_pageno - oldest_pageno) * DTS_MaxTidsPerPage <= maxtids)
 		{
 			/* Read dead tids from the dead tuple store. */
 			deadtidstate->num_tids = DTS_ReadDeadtids(deadtidstate,
@@ -364,7 +404,9 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 													  &last_pageread);
 			Assert(last_pageread == next_pageno - 1);
 
-			/* TODO sort the dead_tids array. */
+			/* Sort the dead_tids array. */
+			qsort((void *) deadtidstate->itemptrs, deadtidstate->num_tids,
+				  sizeof(ItemPointerData), dts_tidcmp);
 		}
 
 		/*
@@ -375,11 +417,20 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 		else
 		{
 			elog(ERROR, "conveyor belt run-merge is not yet implemented");
+			dts_merge_runs(deadtidstate);
 		}
 
 	}
 
-	/* TODO load next set of blocks if required */
+	/* 
+	 * If next run page is not allocated that mean all data is already loaded
+	 * in cache so nothing to do.
+	 */
+	if (deadtidstate->next_run_page != NULL)
+	{
+		elog(ERROR, "conveyor belt run-merge is not yet implemented");
+		dts_merge_runs(deadtidstate);
+	}
 }
 
 /*
@@ -388,41 +439,21 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 bool
 DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, ItemPointerData *tid)
 {
-	int			low,
-				high,
-				mid,
-				res;
-
 	if (deadtidstate == NULL || deadtidstate->itemptrs == NULL)
 		return false;
 
-	low = 0;
-	high = deadtidstate->num_tids;
-	Assert(high >= low);
-
-	while (high > low)
-	{
-		mid = low + ((high - low) / 2);
-		res = ItemPointerCompare(tid, &deadtidstate->itemptrs[mid]);
-
-		if (res > 0)
-			low = mid + 1;
-		else if (res < 0)
-			high = mid;
-		else
-			return true;
-	}
-
-	return false;
+	return bsearch((void *) tid, (void *) deadtidstate->itemptrs,
+				   deadtidstate->num_tids, sizeof(ItemPointerData),
+				   dts_tidcmp);
 }
 
 /*
- * DTS_SetNextRunpage - Set nextrunpage in deadtid page.
+ * DTS_SetNextRun - Set next run start page.
  */
 void
-DTS_SetNextRunpage(DTS_DeadTidState	*deadtidstate)
+DTS_SetNextRun(DTS_DeadTidState	*deadtidstate)
 {
-	DTSPageData *deadtidpd;
+	DTS_PageData *deadtidpd;
 	Buffer	buffer;
 	Page	page;
 
@@ -434,7 +465,7 @@ DTS_SetNextRunpage(DTS_DeadTidState	*deadtidstate)
 			 deadtidstate->start_page);
 
 	page = BufferGetPage(buffer);
-	deadtidpd = (DTSPageData *) PageGetSpecialPointer(page);
+	deadtidpd = (DTS_PageData *) PageGetSpecialPointer(page);
 	deadtidpd->nextrunpage = deadtidstate->last_page + 1;
 
 	/* TODO - WAL log this operation*/
