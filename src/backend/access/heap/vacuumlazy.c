@@ -1221,9 +1221,12 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 			 * storage can be used by other vacuum cycle.
 			 */
 			if (params->options & VACOPT_FIRST_PASS)
+			{
 				DTS_InsertDeadtids(vacrel->deadtidstate,
 								   vacrel->dead_tuples->num_tuples,
 								   vacrel->dead_tuples->itemptrs);
+				vacrel->dead_tuples->num_tuples = 0;
+			}
 			else
 				lazy_vacuum(vacrel);
 
@@ -3306,6 +3309,10 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	from_pageno = vacrel->rel->rd_rel->cbvacuumpage;
 	if (from_pageno == CB_INVALID_LOGICAL_PAGE)
 		from_pageno = 0;
+
+	/* We have already done enough vacuum so nothing to be done. */
+	if (from_pageno == to_pageno)
+		return;
 
 	/* Initialize deadtid state. */
 	dts = DTS_InitDeadTidState(vacrel->rel);
