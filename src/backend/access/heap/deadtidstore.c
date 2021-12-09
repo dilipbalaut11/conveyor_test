@@ -453,6 +453,8 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
 		return;
 	}
 
+	runstate->runindex[run] = 0;
+
 	if (run < runstate->num_runs - 1)
 		endpage = runstate->startpage[run + 1];
 	else
@@ -476,8 +478,12 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
 		nremaining -= ntids;
 	}
 
-	if (prevpage == endpage)
+	if (prevpage >= endpage)
 		runstate->nextpage[run] = CB_INVALID_LOGICAL_PAGE;
+	else if (startpage == prevpage)
+		runstate->nextpage[run] = prevpage;
+	else
+		runstate->nextpage[run] = prevpage + 1;
 }
 
 /*
@@ -546,10 +552,7 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 			{
 				dts_load_run(deadtidstate, nRunCount);
 				if (runstate->runindex[nRunCount] != -1)
-				{
-					runstate->runindex[nRunCount] = 0;
 					nexttid = DTS_NextRunItem(runstate, nRunCount, maxtidperrun);
-				}
 			}
 
 			if (ItemPointerIsValid(nexttid) &&
