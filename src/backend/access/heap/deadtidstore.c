@@ -31,6 +31,7 @@ typedef struct DTS_RunState
 	int		num_runs;		/* number of runs in conveyor belt. */
 	int		maxtid;			/* max number of tid in cache */
 	int	   *runindex;		/* current index into each run. */
+	CBPageNo		   *startpage;	/* start cb pageno for each run. */
 	CBPageNo		   *nextpage;	/* next cb pageno for each run. */
 	ItemPointerData	   *itemptrs;	/* tid cache for each runs. */
 } DTS_RunState;
@@ -447,10 +448,13 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
 
 	startpage = runstate->nextpage[run];
 	if (startpage == CB_INVALID_LOGICAL_PAGE)
+	{
+		runstate->runindex[run] = -1;
 		return;
+	}
 
 	if (run < runstate->num_runs - 1)
-		endpage = runstate->nextpage[run + 1];
+		endpage = runstate->startpage[run + 1];
 	else
 		endpage = CB_INVALID_LOGICAL_PAGE;
 	
@@ -471,7 +475,9 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
 		itemptrs += ntids;
 		nremaining -= ntids;
 	}
-	runstate->nextpage[run] = prevpage;
+
+	if (prevpage == endpage)
+		runstate->nextpage[run] = CB_INVALID_LOGICAL_PAGE;
 }
 
 /*
@@ -513,7 +519,7 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 			   sizeof(ItemPointerData) * ntids);
 	}
 
-	maxtidperrun = maxtid/runstate->num_runs;
+	maxtidperrun = runstate->maxtid/runstate->num_runs;
 
 	/* Reload the cache from each run. */
 	while (ntids < maxtid)
@@ -526,6 +532,9 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 		{
 			ItemPointerData		*nexttid;
 
+			if (runstate->runindex[nRunCount] == -1)
+				continue;
+
 			/* Get the next tid from this run. */
 			nexttid = DTS_NextRunItem(runstate, nRunCount, maxtidperrun);
 
@@ -535,9 +544,12 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 			 */
 			if (!ItemPointerIsValid(nexttid))
 			{
-				runstate->runindex[nRunCount] = 0;
 				dts_load_run(deadtidstate, nRunCount);
-				nexttid = DTS_NextRunItem(runstate, nRunCount, maxtidperrun);
+				if (runstate->runindex[nRunCount] != -1)
+				{
+					runstate->runindex[nRunCount] = 0;
+					nexttid = DTS_NextRunItem(runstate, nRunCount, maxtidperrun);
+				}
 			}
 
 			if (ItemPointerIsValid(nexttid) &&
@@ -592,11 +604,12 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 	{
 		if (runstate->itemptrs != NULL)
 			pfree(runstate->itemptrs);
+		if (runstate->startpage != NULL)
+			pfree(runstate->startpage);			
 		if (runstate->nextpage != NULL)
 			pfree(runstate->nextpage);
 		if (runstate->runindex != NULL)
 			pfree(runstate->runindex);
-
 		pfree(deadtidstate->deadtidrun);
 
 		deadtidstate->deadtidrun = NULL;
@@ -669,9 +682,11 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 
 	Assert(nRunCount > 0);
 	deadtidrun->num_runs = nRunCount;
+	deadtidrun->startpage = palloc(nRunCount * sizeof(CBPageNo));
 	deadtidrun->nextpage = palloc(nRunCount * sizeof(CBPageNo));
 	deadtidrun->runindex = palloc0(nRunCount * sizeof(int));
 	memcpy(deadtidrun->nextpage, next_run_page, nRunCount * sizeof(CBPageNo));
+	memcpy(deadtidrun->startpage, next_run_page, nRunCount * sizeof(CBPageNo));
 	pfree(next_run_page);
 
 	/* FIXME: for debugging purpose. */
