@@ -24,15 +24,43 @@
 
 
 /*
- * State of the cache over the vacuum runs in the conveyor belt.
+ * State of the cache over the vacuum runs in the conveyor belt.  Druring
+ * vacuum first pass we need to check if the deadtid is already present in
+ * the conveyor belt then don't add it again.  For that we need to load the
+ * existing conveyor belt data in cache for checking the duplicates.  So
+ * instead of sorting complete conveyor belt data using tuple sort we already
+ * know that each conveyor belt runs are already sorted, so we load a few
+ * logical pages from each conveyor belt and perform merge sort over those.
+ * So this structure maintain the current state of the cache over each runs.
+ * and also the deadtids from each run.
  */
 typedef struct DTS_RunState
 {
-	int		num_runs;		/* number of runs in conveyor belt. */
-	int		maxtid;			/* max number of tid in cache */
-	int	   *runindex;		/* current index into each run. */
-	CBPageNo		   *startpage;	/* start cb pageno for each run. */
-	CBPageNo		   *nextpage;	/* next cb pageno for each run. */
+	/* Total number of runs in the conveyor belt. */
+	int		num_runs;
+
+	/* Max number tids we can load into the cache from all runs. */
+	int		maxtid;
+
+	/*
+	 * During merge of each run, this maintains the current deadtid index
+	 * in to the cache for each runs.
+	 */
+	int	   *runindex;
+
+	/* Starting logical conveyor belt pageno for each run. */
+	CBPageNo		   *startpage;
+
+	/* Next logical conveyor belt pageno to load for each run. */
+	CBPageNo		   *nextpage;
+
+	/*
+	 * Current cache tids for each run.  This is not completely sorted but
+	 * each run is sorted and we devide this cache size equally for the runs
+	 * so we directly what is the start tid for each run.  These runs are
+	 * merged into a different cache DTS_DeadTidState->itemptrs which is
+	 * complete sorted cache and used for duplicate detection.
+	 */
 	ItemPointerData	   *itemptrs;	/* tid cache for each runs. */
 } DTS_RunState;
 
@@ -66,14 +94,15 @@ typedef struct DTS_PageData
 #define DTS_SizeOfDeadTids(cnt) \
 			 mul_size(sizeof(ItemPointerData), cnt)
 
-#define DTS_NextRunItem(runstate, run, maxtid) \
-	((runstate)->itemptrs + ((run) * (maxtid) + (runstate)->runindex[(run)]))
+#define DTS_NextRunItem(runstate, run, maxtidperrun) \
+	((runstate)->itemptrs + ((run) * (maxtidperrun) + (runstate)->runindex[(run)]))
 
 /* non-export function prototypes */
 static void dts_page_init(Page page);
 static int32 dts_tidcmp(const void *a, const void *b);
 static void dts_load_run(DTS_DeadTidState *deadtidstate, int run);
-static void dts_merge_runs(DTS_DeadTidState *deadtidstate);
+static void dts_merge_runs(DTS_DeadTidState *deadtidstate,
+						   bool preserve_last_blk);
 static void dts_process_runs(DTS_DeadTidState *deadtidstate);
 
 /*
@@ -281,7 +310,12 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 	/* Get conveyor belt page range. */
 	ConveyorBeltGetBounds(deadtidstate->cb, &oldest_pageno, &next_pageno);
 
-	/* No data in the conveyor belt. */
+	/*
+	 * If the oldest_page is same as next page then there is no data in the
+	 * conveyor belt, simmiarlly if oldest page is same as the start page of
+	 * this run then there is no previous runs in the conveyor belt so we don't
+	 * need to worry about checking the duplicates.
+	 */
 	if ((oldest_pageno == next_pageno) ||
 		(oldest_pageno == deadtidstate->start_page))
 		return;
@@ -329,7 +363,8 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 	}
 
 	/* 
-	 * If all the data is already loaded in the cache then nothing to be done.
+	 * If deadtidrun is NULL that means all the data is already loaded in the
+	 * cache so nothing to be done.
 	 */
 	if (deadtidstate->deadtidrun == NULL)
 		return;
@@ -337,16 +372,24 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 	/*
 	 * Check if the block no of the last tid in the cache is > the input block
 	 * number then we have all the tids at least for the input block so we
-	 * don't need to load more tids for now.
+	 * don't need to load more tids for now.  If the current blockno is same
+	 * as the last deadtid's block then we are not sure whether we have all the
+	 * tids w.r.t the input block or not so we need to load more tids.
 	 */
-	if (deadtidstate->num_tids > 0 &&  ItemPointerGetBlockNumberNoCheck(
-		&deadtidstate->itemptrs[deadtidstate->num_tids - 1]) > blkno)
+	if (deadtidstate->num_tids > 0)
 	{
-		return;
-	}
+		BlockNumber	last_blckno = ItemPointerGetBlockNumber(
+					&deadtidstate->itemptrs[deadtidstate->num_tids - 1]);
 
-	/* Load more tids in cache from each runs. */
-	dts_merge_runs(deadtidstate);
+		if (last_blckno > blkno)
+			return;
+		else if (last_blckno < blkno)
+			dts_merge_runs(deadtidstate, false);
+		else
+			dts_merge_runs(deadtidstate, true);
+	}
+	else
+		dts_merge_runs(deadtidstate, false);
 }
 
 /*
@@ -493,7 +536,7 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
  * starting of each block based on the cache size.
  */
 static void
-dts_merge_runs(DTS_DeadTidState *deadtidstate)
+dts_merge_runs(DTS_DeadTidState *deadtidstate, bool preserve_last_blk)
 {
 	DTS_RunState	   *runstate = deadtidstate->deadtidrun;
 	ItemPointerData    *smallesttid = NULL;
@@ -505,24 +548,22 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate)
 	int		preserve_tids;
 
 	/*
-	 * If this is not the first time we are merging then preserve the tids
-	 * for the last block, so that if in previous merge we have loaded some
-	 * tids for this block then this time we can get all.  This can be
-	 * optimized if the block we are currently pruning is not the same as
-	 * the last tid's block in cache then we can overwrite all the tids.
+	 * Preserve the tids w.r.t the last heap block if the caller has asked to
+	 * do so.  For detail, refer comments in DTS_LoadDeadtids, where this
+	 * function is called.
 	 */
-	if (deadtidstate->num_tids == -1)
-	{
-		maxtid = runstate->maxtid;
-		preserve_tids = ntids = 0;
-	}
-	else
+	if (preserve_last_blk)
 	{
 		maxtid = runstate->maxtid - MaxHeapTuplesPerPage;
 		preserve_tids = ntids = runstate->maxtid - maxtid;
 		memcpy(deadtidstate->itemptrs,
 			   &deadtidstate->itemptrs[deadtidstate->num_tids - ntids],
 			   sizeof(ItemPointerData) * ntids);
+	}
+	else
+	{
+		maxtid = runstate->maxtid;
+		preserve_tids = ntids = 0;
 	}
 
 	maxtidperrun = runstate->maxtid/runstate->num_runs;
