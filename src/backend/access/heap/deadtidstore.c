@@ -73,7 +73,7 @@ struct DTS_DeadTidState
 	CBPageNo		start_page;			/* start page for this run. */
 	CBPageNo		last_page;			/* last page for this run. */
 	int				num_tids;			/* number of of dead tids. */
-	ItemPointerData	   *itemptrs;		/* dead tid cache. */
+	ItemPointerData	   *itemptrs;		/* dead tids for the current scan block */
 	DTS_RunState	   *deadtidrun;		/* dead tid run cache state. */
 };
 
@@ -101,8 +101,7 @@ typedef struct DTS_PageData
 static void dts_page_init(Page page);
 static int32 dts_tidcmp(const void *a, const void *b);
 static void dts_load_run(DTS_DeadTidState *deadtidstate, int run);
-static void dts_merge_runs(DTS_DeadTidState *deadtidstate,
-						   bool preserve_last_blk);
+static void dts_merge_runs(DTS_DeadTidState *deadtidstate);
 static void dts_process_runs(DTS_DeadTidState *deadtidstate);
 
 /*
@@ -323,46 +322,21 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 	/* If deadtid cache is not yet intialize then do it now. */
 	if (deadtidstate->num_tids == -1)
 	{
-		CBPageNo		last_pageread;
-
 		/* Allocate space for deadtid cache. */
-		deadtidstate->itemptrs =
-					(ItemPointerData *) palloc(DTS_SizeOfDeadTids(maxtids));
-
-		/*
-		 * If we can load all the deadtids in the cache then read all the tids
-		 * directly into the cache, and sort them. 		 
-		 */
-		if ((next_pageno - oldest_pageno) * DTS_MaxTidsPerPage <= maxtids)
-		{
-			/* Read dead tids from the dead tuple store. */
-			deadtidstate->num_tids = DTS_ReadDeadtids(deadtidstate,
-													  oldest_pageno,
-													  CB_INVALID_LOGICAL_PAGE,
-													  maxtids,
-													  deadtidstate->itemptrs,
-													  &last_pageread);
-			Assert(last_pageread == next_pageno - 1);
-
-			/* Sort the dead_tids array. */
-			qsort((void *) deadtidstate->itemptrs, deadtidstate->num_tids,
-				  sizeof(ItemPointerData), dts_tidcmp);
-		}
+		deadtidstate->itemptrs = (ItemPointerData *) palloc(
+									DTS_SizeOfDeadTids(MaxHeapTuplesPerPage));
 
 		/*
 		 * Compute the number of runs available in the conveyor belt and check
 		 * whether we have enough cache to load at least one block from each
 		 * run, if so then we can peroform in-memory merge of the runs.
 		 */
-		else
-		{
-			deadtidstate->deadtidrun = palloc0(sizeof(DTS_RunState));
-			deadtidstate->deadtidrun->maxtid = maxtids;
-			dts_process_runs(deadtidstate);
-		}
+		deadtidstate->deadtidrun = palloc0(sizeof(DTS_RunState));
+		deadtidstate->deadtidrun->maxtid = maxtids;
+		dts_process_runs(deadtidstate);
 	}
 
-	/* 
+	/*
 	 * If deadtidrun is NULL that means all the data is already loaded in the
 	 * cache so nothing to be done.
 	 */
@@ -370,26 +344,15 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 		return;
 
 	/*
-	 * Check if the block no of the last tid in the cache is > the input block
-	 * number then we have all the tids at least for the input block so we
-	 * don't need to load more tids for now.  If the current blockno is same
-	 * as the last deadtid's block then we are not sure whether we have all the
-	 * tids w.r.t the input block or not so we need to load more tids.
+	 * Check the current block number in the deadtid cache and the block is
+	 * smaller than the block we are processing now then load the data for
+	 * the next block.
 	 */
-	if (deadtidstate->num_tids > 0)
-	{
-		BlockNumber	last_blckno = ItemPointerGetBlockNumber(
-					&deadtidstate->itemptrs[deadtidstate->num_tids - 1]);
-
-		if (last_blckno > blkno)
-			return;
-		else if (last_blckno < blkno)
-			dts_merge_runs(deadtidstate, false);
-		else
-			dts_merge_runs(deadtidstate, true);
-	}
+	if (deadtidstate->num_tids > 0 &&
+		ItemPointerGetBlockNumber(&deadtidstate->itemptrs[0]) >= blkno)
+		return;
 	else
-		dts_merge_runs(deadtidstate, false);
+		dts_merge_runs(deadtidstate);
 }
 
 /*
@@ -536,54 +499,36 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
  * starting of each block based on the cache size.
  */
 static void
-dts_merge_runs(DTS_DeadTidState *deadtidstate, bool preserve_last_blk)
+dts_merge_runs(DTS_DeadTidState *deadtidstate)
 {
 	DTS_RunState	   *runstate = deadtidstate->deadtidrun;
 	ItemPointerData    *smallesttid = NULL;
+	BlockNumber			blkno = InvalidBlockNumber;
 	int		nRunCount;
 	int		smallestrun;
 	int		maxtidperrun;
-	int		maxtid;
-	int		ntids;
-	int		preserve_tids;
+	int		ntids = 0;
 
-	/*
-	 * Preserve the tids w.r.t the last heap block if the caller has asked to
-	 * do so.  For detail, refer comments in DTS_LoadDeadtids, where this
-	 * function is called.
-	 */
-	if (preserve_last_blk)
-	{
-		maxtid = runstate->maxtid - MaxHeapTuplesPerPage;
-		preserve_tids = ntids = runstate->maxtid - maxtid;
-		memcpy(deadtidstate->itemptrs,
-			   &deadtidstate->itemptrs[deadtidstate->num_tids - ntids],
-			   sizeof(ItemPointerData) * ntids);
-	}
-	else
-	{
-		maxtid = runstate->maxtid;
-		preserve_tids = ntids = 0;
-	}
+	/* Compute the max tids can be fit into each run cache. */
+	maxtidperrun = runstate->maxtid / runstate->num_runs;
 
-	maxtidperrun = runstate->maxtid/runstate->num_runs;
-
-	/* Reload the cache from each run. */
-	while (ntids < maxtid)
+	/* Load data for the next block from the cache. */
+	while (1)
 	{
 		/*
-		* Pass over each run and perform merge, if any run is out of data then
-		* load more data from the conveyor belt. 
-		*/
+		 * Pass over each run and perform merge, if any run is out of data then
+		 * load more data from the conveyor belt.
+		 */
 		for (nRunCount = 0; nRunCount < runstate->num_runs; nRunCount++)
 		{
-			ItemPointerData		*nexttid;
+			ItemPointerData		*nexttid = NULL;
 
 			if (runstate->runindex[nRunCount] == -1)
 				continue;
 
 			/* Get the next tid from this run. */
-			nexttid = DTS_NextRunItem(runstate, nRunCount, maxtidperrun);
+			if (runstate->runindex[nRunCount] < maxtidperrun)
+				nexttid = DTS_NextRunItem(runstate, nRunCount, maxtidperrun);
 
 			/*
 			 * If the current tid in the cache of the current run is invalid
@@ -596,9 +541,13 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, bool preserve_last_blk)
 					nexttid = DTS_NextRunItem(runstate, nRunCount, maxtidperrun);
 			}
 
-			if (ItemPointerIsValid(nexttid) &&
-				(!ItemPointerIsValid(smallesttid) ||
-				ItemPointerCompare(nexttid, smallesttid) < 0))
+			/* If we did not get a valid tid from this run then continue. */
+			if (!ItemPointerIsValid(nexttid))
+				continue;
+
+			/* Set the smallest tid. */
+			if (!ItemPointerIsValid(smallesttid) ||
+				ItemPointerCompare(nexttid, smallesttid) < 0)
 			{
 				smallesttid = nexttid;
 				smallestrun = nRunCount;
@@ -609,42 +558,25 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, bool preserve_last_blk)
 		if (!ItemPointerIsValid(smallesttid))
 			break;
 
+		/* This tid is for another block so we are done. */
+		if (!BlockNumberIsValid(blkno))
+			blkno = ItemPointerGetBlockNumber(smallesttid);
+		else if (ItemPointerGetBlockNumber(smallesttid) != blkno)
+			break;					
+
 		/* Go to the next index in the run which gave smallest tid. */
 		(runstate->runindex[smallestrun])++;
 
-		if (runstate->runindex[smallestrun] > maxtidperrun)
-		{
-			runstate->runindex[smallestrun] = 0;
-
-			/* Load more data from the conveyor belt in this run. */
-			dts_load_run(deadtidstate, smallestrun);
-		}
 		ItemPointerCopy(smallesttid, &deadtidstate->itemptrs[ntids]);
 		smallesttid = NULL;
 		ntids++;
+		Assert(ntids <= MaxHeapTuplesPerPage);
 	}
 
 	deadtidstate->num_tids = ntids;
 
-	/* FIXME: for debugging purpose. */
-	elog(LOG, "merge run completed, next page info");
-
-	for (nRunCount = 0; nRunCount < runstate->num_runs; nRunCount++)
-	{
-		elog(LOG, "run information, run = %d page = " UINT64_FORMAT,
-			 nRunCount, runstate->nextpage[nRunCount]);
-	}
-
-	elog(LOG, "first tid in cache block=%d offset=%d",
-			  ItemPointerGetBlockNumber(&deadtidstate->itemptrs[0]),
-			  ItemPointerGetOffsetNumber(&deadtidstate->itemptrs[0]));
-
-	elog(LOG, "last tid in cache block=%d offset=%d",
-			  ItemPointerGetBlockNumber(&deadtidstate->itemptrs[ntids - 1]),
-			  ItemPointerGetOffsetNumber(&deadtidstate->itemptrs[ntids - 1]));
-
-	/* No more tids to be load from the run, so release the runstate. */
-	if (preserve_tids == ntids)
+	/* No more tids to be load, so release the runstate. */
+	if (ntids == 0)
 	{
 		if (runstate->itemptrs != NULL)
 			pfree(runstate->itemptrs);
