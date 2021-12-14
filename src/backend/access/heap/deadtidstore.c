@@ -83,6 +83,13 @@ typedef struct DTS_PageData
 	CBPageNo	nextrunpage;
 } DTS_PageData;
 
+/* Block header. */
+typedef struct DTS_BlockHeader
+{
+	BlockNumber	blkno;
+	int			noffset;
+} DTS_BlockHeader;
+
 /* Max dead tids per conveyor belt page. */
 #define DTS_MaxTidsPerPage \
 	(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(DTS_PageData)) / sizeof(ItemPointerData)
@@ -150,41 +157,63 @@ DTS_InitDeadTidState(Relation rel)
  *	DTS_InsertDeadtids() -- Insert given deadtids into the conveyor belt.
  */
 void
-DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, int ntids,
-				   ItemPointerData *deadtids)
+DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
+				   int noffset, OffsetNumber *offsets)
 {
 	ConveyorBelt   *cb = deadtidstate->cb;
-	CBPageNo		pageno;
+	CBPageNo		pageno = deadtidstate->last_page;
 
 	/* Loop until we flush out all the dead tids in the conveyor belt. */
-	while(ntids > 0)
+	while(noffset > 0)
 	{
 		Buffer	buffer;
 		Page	page;
 		char   *pagedata;
 		int		count;
+		int		freespace;
+		bool	newpage = false;
 		PageHeader	phdr;
+		DTS_BlockHeader	blkhdr;
 
-		/* Get a new page from the ConveyorBelt. */
-		buffer = ConveyorBeltGetNewPage(cb, &pageno);
-		page = BufferGetPage(buffer);
-		dts_page_init(page);
+		/*
+		 * If we are starting a new run then start from a fresh page,
+		 * otherwise, continue writing into the previous page.
+		 */
+		if (pageno == CB_INVALID_LOGICAL_PAGE)
+		{
+			newpage = true;
+			buffer = ConveyorBeltGetNewPage(cb, &pageno);
+			page = BufferGetPage(buffer);
+			dts_page_init(page);			
+		}
+		else
+		{
+			buffer = ConveyorBeltReadBuffer(cb, pageno, BUFFER_LOCK_EXCLUSIVE,
+											NULL);
+			page = BufferGetPage(buffer);
+		}
+
 		phdr = (PageHeader) page;
-		pagedata = PageGetContents(page);
-
-		/* Compute how many dead tids we can store into this page. */
-		count =  Min(DTS_MaxTidsPerPage, ntids);
+		pagedata = (char *) page + phdr->pd_lower;
+		freespace = PageGetExactFreeSpace(page);
 
 		START_CRIT_SECTION();
-		/*
-		 * Copy the data into the page and set the pd_lower.  We are just
-		 * copying ItemPointerData array so we don't need any alignment which
-		 * should be SHORTALIGN and sizeof(ItemPointerData) will take care of
-		 * that so we don't need any other alignment.
-		 */
-		memcpy(pagedata, deadtids, sizeof(ItemPointerData) * count);
-		phdr->pd_lower += sizeof(ItemPointerData) * count;
-		ConveyorBeltPerformInsert(cb, buffer);
+
+		blkhdr.blkno = blkno;
+		blkhdr.noffset = Min(freespace / sizeof(OffsetNumber), noffset);
+
+		memcpy(pagedata, &blkhdr, sizeof(DTS_BlockHeader));
+		pagedata += sizeof(DTS_BlockHeader);
+		phdr->pd_lower += sizeof(DTS_BlockHeader);
+		memcpy(pagedata, offsets, blkhdr.noffset * sizeof(OffsetNumber));
+		phdr->pd_lower += blkhdr.noffset * sizeof(OffsetNumber);
+
+		if (newpage)
+			ConveyorBeltPerformInsert(cb, buffer);
+		else
+		{
+			/* WAL log this operation. */
+		}
 
 		END_CRIT_SECTION();
 
@@ -194,9 +223,11 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, int ntids,
 		if (deadtidstate->start_page == CB_INVALID_LOGICAL_PAGE)
 			deadtidstate->start_page = pageno;
 
+		pageno = CB_INVALID_LOGICAL_PAGE;
+
 		/* Adjust deadtid pointer and the remaining tid count. */
-		deadtids += count;
-		ntids -= count;
+		offsets += blkhdr.noffset;
+		noffset -= blkhdr.noffset;
 	}
 
 	deadtidstate->last_page = pageno;
@@ -431,11 +462,15 @@ DTS_Vacuum(DTS_DeadTidState	*deadtidstate, CBPageNo	pageno)
 static void
 dts_page_init(Page page)
 {
+	PageHeader	p = (PageHeader) page;
 	DTS_PageData	   *deadtidpd;
 
 	PageInit(page, BLCKSZ, sizeof(DTS_PageData));
 	deadtidpd = (DTS_PageData *) PageGetSpecialPointer(page);
 	deadtidpd->nextrunpage = CB_INVALID_LOGICAL_PAGE;
+
+	/* Start writing data from the maxaligned offset. */
+	p->pd_lower = MAXALIGN(SizeOfPageHeaderData);
 }
 
 /*
