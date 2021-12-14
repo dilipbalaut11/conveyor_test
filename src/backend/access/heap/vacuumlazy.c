@@ -1667,9 +1667,12 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 			lazy_vacuum(vacrel);
 	}
 
-	/* First pass is complete so set the next run page. */
+	/* 
+	 * First pass is complete so set the next run page and release the deadtid
+	 * state.
+	 */
 	if (params->options & VACOPT_FIRST_PASS)
-		DTS_SetNextRun(vacrel->deadtidstate);
+		DTS_ReleaseDeadTidState(vacrel->deadtidstate);
 
 	/*
 	 * Vacuum the remainder of the Free Space Map.  We must do this whether or

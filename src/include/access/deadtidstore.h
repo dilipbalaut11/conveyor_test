@@ -32,7 +32,7 @@ extern void DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 							 int maxtids);
 extern bool DTS_DeadtidExists(DTS_DeadTidState *deadtidstate,
 							  ItemPointerData *tid);
-extern void DTS_SetNextRun(DTS_DeadTidState	*deadtidstate);
+extern void DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate);
 extern void DTS_Vacuum(DTS_DeadTidState	*deadtidstate, CBPageNo	pageno);
 
 #endif							/* DEADTIDSTORE_H */
