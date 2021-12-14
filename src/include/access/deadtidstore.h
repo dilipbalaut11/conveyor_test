@@ -18,20 +18,45 @@
 #include "storage/itemptr.h"
 #include "utils/relcache.h"
 
+/*
+ * In conveyor belt instead of saving the complete deadtids we will stored the
+ * compressed format, i.e. [blkno, noffsets] [off-1][off-2]..[off-n], and
+ * whenever we are going for index vacuum we can convert it back to the dead
+ * tid array.  So instead of converting it right after pruning each page
+ * as we are doing it now we will delay it until we are not going for index
+ * vacuum.
+ */
+typedef struct DTS_BlockHeader
+{
+	BlockNumber		blkno;
+	int				noffsets;
+} DTS_BlockHeader;
+
+/* Next run page number in the special space. */
+typedef struct DTS_PageData
+{
+	CBPageNo	nextrunpage;
+} DTS_PageData;
+
+#define DTS_PageMaxDataSpace \
+		(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(DTS_PageData))
+#define DTS_BlkDataSize(noffset) \
+		sizeof(DTS_BlockHeader) + sizeof (OffsetNumber) * (noffset)
+
 struct DTS_DeadTidState;
 typedef struct DTS_DeadTidState DTS_DeadTidState;
 
 extern DTS_DeadTidState *DTS_InitDeadTidState(Relation rel);
-extern void DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, int ntids,
-							   ItemPointerData *deadtids);
+extern void DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data,
+							   int size);
 extern int DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate,
 							CBPageNo from_pageno, CBPageNo to_pageno,
 							int maxtids, ItemPointerData *deadtids,
 							CBPageNo *last_pageread);
-extern void DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
-							 int maxtids);
+extern void DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate,
+							 BlockNumber blkno);
 extern bool DTS_DeadtidExists(DTS_DeadTidState *deadtidstate,
-							  ItemPointerData *tid);
+							  BlockNumber blkno, OffsetNumber offset);
 extern void DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate);
 extern void DTS_Vacuum(DTS_DeadTidState	*deadtidstate, CBPageNo	pageno);
 
