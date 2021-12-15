@@ -1,0 +1,185 @@
+CREATE EXTENSION pg_conveyor;
+CREATE TABLE test(a int);
+SELECT pg_conveyor_init('test'::regclass::oid, 4);
+ pg_conveyor_init 
+------------------
+ 
+(1 row)
+
+SELECT pg_conveyor_insert('test'::regclass::oid, 'test_data');
+ pg_conveyor_insert 
+--------------------
+ 
+(1 row)
+
+SELECT pg_conveyor_read('test'::regclass::oid, 0);
+ pg_conveyor_read 
+------------------
+ test_data
+(1 row)
+
+--CASE1
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..1000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+-- read from some random blocks
+SELECT pg_conveyor_read('test'::regclass::oid, 100);
+               pg_conveyor_read                
+-----------------------------------------------
+ test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa100
+(1 row)
+
+SELECT pg_conveyor_read('test'::regclass::oid, 800);
+               pg_conveyor_read                
+-----------------------------------------------
+ test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa800
+(1 row)
+
+--CASE2
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..5000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i+1000;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+SELECT pg_conveyor_read('test'::regclass::oid, 4000);
+                pg_conveyor_read                
+------------------------------------------------
+ test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa4000
+(1 row)
+
+SELECT pg_conveyor_read('test'::regclass::oid, 3000);
+                pg_conveyor_read                
+------------------------------------------------
+ test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa3000
+(1 row)
+
+--CASE3
+DROP TABLE test;
+CREATE TABLE test(a int);
+SELECT pg_conveyor_init('test'::regclass::oid, 4);
+ pg_conveyor_init 
+------------------
+ 
+(1 row)
+
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..50000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+--CASE4--(vacuum is failing)
+DROP TABLE test;
+CREATE TABLE test(a int);
+SELECT pg_conveyor_init('test'::regclass::oid, 4);
+ pg_conveyor_init 
+------------------
+ 
+(1 row)
+
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..5000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+SELECT pg_conveyor_truncate('test'::regclass::oid, 3000);
+ pg_conveyor_truncate 
+----------------------
+ 
+(1 row)
+
+--SELECT pg_conveyor_vacuum('test'::regclass::oid); //not implemented
+--CASE5
+DROP TABLE test;
+CREATE TABLE test(a int);
+SELECT pg_conveyor_init('test'::regclass::oid, 4);
+ pg_conveyor_init 
+------------------
+ 
+(1 row)
+
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..50000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+--CASE6 (multi truncate single vacuum)
+DROP TABLE test;
+CREATE TABLE test(a int);
+SELECT pg_conveyor_init('test'::regclass::oid, 4);
+ pg_conveyor_init 
+------------------
+ 
+(1 row)
+
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..1000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+SELECT pg_conveyor_truncate('test'::regclass::oid, 500);
+ pg_conveyor_truncate 
+----------------------
+ 
+(1 row)
+
+do $$
+<<first_block>>
+declare
+  i int := 0;
+  data varchar;
+begin
+  for i in 1..1000 loop
+	data := 'test_dataaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' || i;
+	PERFORM pg_conveyor_insert('test'::regclass::oid, data);
+  end loop;
+end first_block $$;
+SELECT pg_conveyor_truncate('test'::regclass::oid, 1800);
+ pg_conveyor_truncate 
+----------------------
+ 
+(1 row)
+
+SELECT pg_conveyor_vacuum('test'::regclass::oid);
+ pg_conveyor_vacuum 
+--------------------
+ 
+(1 row)
+
