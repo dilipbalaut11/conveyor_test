@@ -21,6 +21,7 @@ OBJS = \
 	pruneheap.o \
 	rewriteheap.o \
 	vacuumlazy.o \
-	visibilitymap.o
+	visibilitymap.o \
+	vacuumdeaditem.o
 
 include $(top_srcdir)/src/backend/common.mk
