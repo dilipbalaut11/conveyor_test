@@ -13,6 +13,7 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 
 OBJS = \
+	deadtidstore.o \
 	heapam.o \
 	heapam_handler.o \
 	heapam_visibility.o \
