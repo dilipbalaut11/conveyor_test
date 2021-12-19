@@ -309,11 +309,6 @@ vacuum(List *relations, VacuumParams *params,
 
 	stmttype = (params->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
 
-	if (params->options & VACOPT_FIRST_PASS)
-		elog(WARNING, "***FIRST PASS VACUUM****");
-	else if (params->options & VACOPT_SECOND_PASS)
-		elog(WARNING, "***SECOND PASS VACUUM****");
-
 	/*
 	 * We cannot run VACUUM inside a user transaction block; if we were inside
 	 * a transaction, then our commit- and start-transaction-command calls
@@ -1906,11 +1901,11 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 		return false;
 	}
 
+	/* If the relation type is index then perform the index vacuum. */
 	if (rel->rd_rel->relkind == RELKIND_INDEX)
 	{
 		Relation	heapRel;
 
-		elog(WARNING, "VACUUMING INDEX");
 		heapRel = table_open(rel->rd_index->indrelid, lmode);
 
 		lazy_vacuum_index(heapRel, rel, vac_strategy);
@@ -1919,6 +1914,7 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 		relation_close(heapRel, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
+
 		return false;
 	}
 
