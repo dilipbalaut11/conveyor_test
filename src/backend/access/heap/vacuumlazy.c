@@ -530,12 +530,17 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	 * table's minimum MultiXactId is older than or equal to the requested
 	 * mxid full-table scan limit; or if DISABLE_PAGE_SKIPPING was specified.
 	 */
-	aggressive = TransactionIdPrecedesOrEquals(rel->rd_rel->relfrozenxid,
-											   xidFullScanLimit);
-	aggressive |= MultiXactIdPrecedesOrEquals(rel->rd_rel->relminmxid,
-											  mxactFullScanLimit);
-	if (params->options & VACOPT_DISABLE_PAGE_SKIPPING)
-		aggressive = true;
+	if (params->options & VACOPT_SECOND_PASS)
+		aggressive = false;
+	else
+	{
+		aggressive = TransactionIdPrecedesOrEquals(rel->rd_rel->relfrozenxid,
+												xidFullScanLimit);
+		aggressive |= MultiXactIdPrecedesOrEquals(rel->rd_rel->relminmxid,
+												mxactFullScanLimit);
+		if (params->options & VACOPT_DISABLE_PAGE_SKIPPING)
+			aggressive = true;
+	}
 
 	vacrel = (LVRelState *) palloc0(sizeof(LVRelState));
 
@@ -2095,9 +2100,12 @@ retry:
 
 			for (int i = 0; i < lpdead_items; i++)
 			{
-				if (!DTS_DeadtidExists(vacrel->deadtidstate, blkno, newdeadoffsets[i]))
+				if (!DTS_DeadtidExists(vacrel->deadtidstate, blkno, deadoffsets[i]))
 					newdeadoffsets[noffsets++] = deadoffsets[i];
 			}
+
+			if (noffsets == 0)
+				goto exit;
 
 			/* 
 			 * Compute the data size for this block and check whether we have
@@ -2155,6 +2163,7 @@ retry:
 									 vacrel->dead_items->num_items);
 	}
 
+exit:
 	/* Finally, add page-local counts to whole-VACUUM counts */
 	vacrel->tuples_deleted += tuples_deleted;
 	vacrel->lpdead_items += lpdead_items;
@@ -3189,7 +3198,7 @@ UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno)
 }
 
 /*
- *	index_vacuum() -- vacuum index relation.
+ *	lazy_vacuum_index() -- vacuum index relation.
  */
 void
 lazy_vacuum_index(Relation heaprel, Relation indrel,
@@ -3197,20 +3206,25 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 {
 	LVDeadItems	   *dead_items;
 	CBPageNo		start_pageno,
+					next_runpage = CB_INVALID_LOGICAL_PAGE,
 					last_pageread = CB_INVALID_LOGICAL_PAGE;
 	LVRelState		vacrel = {0};
 	DTS_DeadTidState	   *dts;
-	IndexBulkDeleteResult  *istat;
+	IndexBulkDeleteResult  *istat = NULL;
 	ErrorContextCallback errcallback;
 
 	/* Initialize vacuum rel state. */
 	lazy_init_vacrel(&vacrel, InvalidBlockNumber);
 	vacrel.bstrategy = strategy;
 
-	/*
-	 * FIXME: what should be this value, for now we need this in
-	 * dead_items_alloc, just to check whether we have index on the relation
-	 * or not.
+	/* 
+	 * We are vacuuming just one index.  Although there is no harm in setting
+	 * the actual number of index but that might be confusing for the parallel
+	 * vacuum system.
+	 *
+	 * FIXME we should provide a mechanishm that even if we are only doing
+	 * index vacuum then there should be option of giving multiple indexes or
+	 * all the indexes of the table.
 	 */
 	vacrel.nindexes = 1;
 
@@ -3250,16 +3264,17 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 												 CB_INVALID_LOGICAL_PAGE,
 												 dead_items->max_items,
 												 dead_items->items,
-												 &last_pageread);
+												 &last_pageread,
+												 &next_runpage);
 
 		/* No more dead tuples so we are done. */
 		if (dead_items->num_items == 0)
 			break;
 
 		/* Do index vacuuming. */
-		istat = lazy_vacuum_one_index(indrel, NULL, heaprel->rd_rel->reltuples,
+		istat = lazy_vacuum_one_index(indrel, istat, heaprel->rd_rel->reltuples,
 									  &vacrel);
-		/* Go to the next logical page. */
+		/* Go to the next logical conveyor belt page. */
 		start_pageno = last_pageread + 1;
 	}
 
@@ -3275,7 +3290,7 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 								 vacrel.num_index_scans);
 
 	/* Update index statistics. */
-	if (istat->estimated_count)
+	if (istat && istat->estimated_count)
 		vac_update_relstats(indrel,
 							istat->num_pages,
 							istat->num_index_tuples,
@@ -3287,6 +3302,9 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 
 	/* Cleanup */
 	dead_items_cleanup(&vacrel);
+	if (istat)
+		pfree(istat);
+	pfree(dts);
 }
 
 /*
@@ -3297,6 +3315,7 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 {
 	CBPageNo	from_pageno;
 	CBPageNo	to_pageno = CB_INVALID_LOGICAL_PAGE;
+	CBPageNo	next_runpage = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	last_pageread;
 	int			i;
 	LVDeadItems		   *dead_items;
@@ -3333,7 +3352,7 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 		from_pageno = 0;
 
 	/* We have already done enough vacuum so nothing to be done. */
-	if (from_pageno == to_pageno)
+	if (from_pageno == to_pageno || to_pageno == CB_INVALID_LOGICAL_PAGE)
 		return;
 
 	/* Initialize deadtid state. */
@@ -3344,10 +3363,11 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	{
 		/* Read dead tids from the conveyor belt. */
 		dead_items->num_items = DTS_ReadDeadtids(dts, from_pageno,
-												   to_pageno,
-												   dead_items->max_items,
-												   dead_items->items,
-												   &last_pageread);
+												 to_pageno,
+												 dead_items->max_items,
+												 dead_items->items,
+												 &last_pageread,
+												 &next_runpage);
 
 		/* No more dead tids, we are done. */
 		if (dead_items->num_items == 0)
@@ -3372,6 +3392,7 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 
 	/* Cleanup */
 	dead_items_cleanup(vacrel);
+	pfree(dts);
 }
 
 /*
