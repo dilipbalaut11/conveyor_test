@@ -480,8 +480,48 @@ vacuum(List *relations, VacuumParams *params,
 
 			if (params->options & VACOPT_VACUUM)
 			{
+				Relation	rel;
+				List	   *indexoidlist;
+				ListCell   *indexoidscan;
+				bool		phase_vacuum;
+
+				/* perform first pass on the heap. */
+				if (IsNormalProcessingMode() && IsAutoVacuumWorkerProcess())
+				{
+					phase_vacuum = true;
+					params->options |= VACOPT_FIRST_PASS;
+				}
+
 				if (!vacuum_rel(vrel->oid, vrel->relation, params))
 					continue;
+				if (phase_vacuum)
+				{
+					MemoryContext oldctx = CurrentMemoryContext; 
+					/* perform vacuum on each index. */
+					StartTransactionCommand();
+					params->options &= ~VACOPT_FIRST_PASS;
+					rel = relation_open(vrel->oid, AccessShareLock);
+					MemoryContextSwitchTo(oldctx);
+					indexoidlist = RelationGetIndexList(rel);
+					relation_close(rel, AccessShareLock);
+					CommitTransactionCommand();
+					foreach(indexoidscan, indexoidlist)
+					{
+						Oid			indexoid = lfirst_oid(indexoidscan);
+
+						if (!vacuum_rel(indexoid, NULL, params))
+							continue;
+					}
+
+					/* 
+					* perform second pass.
+					* XXX eventually this second pass could be done with the next
+					* first pass scan.
+					*/
+					params->options |= VACOPT_SECOND_PASS;
+					if (!vacuum_rel(vrel->oid, vrel->relation, params))
+						continue;
+				}
 			}
 
 			if (params->options & VACOPT_ANALYZE)

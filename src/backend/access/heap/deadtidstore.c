@@ -177,6 +177,9 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 	CBPageNo		pageno = deadtidstate->last_page;
 	DTS_BlockHeader	blkhdr;
 
+	elog(DEBUG1, "inserting data to the conveyor belt total size %d",
+		 datasize);
+
 	blkhdr.blkno = InvalidBlockNumber;
 
 	/* Loop until we flush out all the dead tids in the conveyor belt. */
