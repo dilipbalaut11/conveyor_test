@@ -125,10 +125,12 @@ static int32 dts_offsetcmp(const void *a, const void *b);
 static void dts_load_run(DTS_DeadTidState *deadtidstate, int run);
 static void dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno);
 static void dts_process_runs(DTS_DeadTidState *deadtidstate);
-static int dts_write_pagedata(Page page, DTS_BlockHeader *prevblkhdr,
-							  char *data, int datasize);
+static int dts_prepare_pagedata(Page page, DTS_BlockHeader *prevblkhdr,
+								DTS_BlockHeader *nextblkhdr, char *data,
+								int datasize, int freespace,
+								bool prevpagesplit, bool *pagesplit);
 static int dts_read_pagedata(Page page, ItemPointerData *deadtids,
-							 int maxtids);							 
+							 int maxtids);
 
 /*
  * DTS_InitDeadTidState - intialize the deadtid state
@@ -184,19 +186,23 @@ DTS_InitDeadTidState(Relation rel)
 void
 DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 {
-	ConveyorBelt   *cb = deadtidstate->cb;
-	CBPageNo		pageno = deadtidstate->last_page;
-	DTS_BlockHeader	blkhdr;
-
-	blkhdr.blkno = InvalidBlockNumber;
+	ConveyorBelt	   *cb = deadtidstate->cb;
+	CBPageNo			pageno = deadtidstate->last_page;
+	DTS_BlockHeader		prevblkhdr;
+	bool				prevpagesplit = false;
 
 	/* Loop until we flush out all the data in the conveyor belt. */
 	while(datasize > 0)
 	{
 		Buffer	buffer;
 		Page	page;
-		int		size = 0;
+		PageHeader	phdr;
+		char   *pagedata;
+		int		copysz = 0;
+		int		freespace;
 		bool	newpage = false;
+		bool	pagesplit = false;
+		DTS_BlockHeader		blkhdr;
 
 		/*
 		 * If we are starting a new run then start from a fresh conveyor belt
@@ -213,6 +219,18 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 			buffer = ConveyorBeltReadBuffer(cb, pageno, BUFFER_LOCK_EXCLUSIVE,
 											NULL);
 			page = BufferGetPage(buffer);
+
+			/*
+			* If we don't have enough space in the page to copy DTS_MinCopySize data
+			* no point in copying anything to this page.
+			*/
+			freespace = PageGetExactFreeSpace(page);
+			if (freespace < DTS_MinCopySize)
+			{
+				UnlockReleaseBuffer(buffer);
+				deadtidstate->last_page = CB_INVALID_LOGICAL_PAGE;
+				continue;
+			}
 		}
 		else
 		{
@@ -220,20 +238,50 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 			buffer = ConveyorBeltGetNewPage(cb, &pageno);
 			page = BufferGetPage(buffer);
 			dts_page_init(page);
+			freespace = PageGetExactFreeSpace(page);
 		}
+
+		phdr = (PageHeader) page;
+		pagedata = (char *) page + phdr->pd_lower;
+
+		/* 
+		 * If there was page split in the previous insertion the keep the
+		 * space for inserting the block header into the new page.
+		 */
+		if (prevpagesplit)
+			freespace -= sizeof(DTS_BlockHeader);
+
+		/*
+		 * Prepare data for inserting into the current page, this will detect
+		 * how much data we can copy into this page, this will also take care
+		 * of manipulating the intermediate block header if there will be some
+		 * page split while copying into this page.
+		 */
+		copysz = dts_prepare_pagedata(page, &prevblkhdr, &blkhdr, data,
+									  datasize, freespace, prevpagesplit,
+									  &pagesplit);
 
 		START_CRIT_SECTION();
 
-		/* 
-		 * Write data into the current page, and update the data pointer and
-		 * the remaining size based on how much data we have copied to this
-		 * page.
+		/*
+		 * If we had a page split while inserting into the previous page then
+		 * first insert the previous block header into this new page and then
+		 * start copying the remaining data.
 		 */
-		size = dts_write_pagedata(page, &blkhdr, data, datasize);
-		data += size;
-		datasize -= size;
+		if (prevpagesplit)
+		{
+			memcpy(pagedata, &prevblkhdr, sizeof(DTS_BlockHeader));
+			pagedata += sizeof(DTS_BlockHeader);
+			phdr->pd_lower += sizeof(DTS_BlockHeader);
+		}
 
-		/* 
+		/* Write data into the current page and update pd_lower. */
+		memcpy(pagedata, data, copysz);
+		phdr->pd_lower += copysz;
+
+		Assert(phdr->pd_lower <= phdr->pd_upper);
+
+		/*
 		 * If we have added new page then add it to the conveyor belt this will
 		 * be WAL logged internally, otherwise if we have reused the previosuly
 		 * written page then WAL log it.
@@ -246,6 +294,19 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 		}
 
 		END_CRIT_SECTION();
+
+		/*
+		 * Update the data pointer and the remaining size based on how much
+		 * data we have copied to this page.
+		 */
+		data += copysz;
+		datasize -= copysz;
+
+		if (pagesplit)
+		{
+			prevblkhdr = blkhdr;
+			prevpagesplit = pagesplit;
+		}
 
 		if (newpage)
 			ConveyorBeltCleanupInsert(cb, buffer);
@@ -537,70 +598,43 @@ dts_page_init(Page page)
 }
 
 /*
- * dts_write_pagedata - copy data into given conveyor belt page.
- * buffer has data in below form.
+ * dts_prepare_pagedata - prepare data to be inserted into the given conveyor
+ * belt page.
  *
- * [block1, noffsets][offset1][offset2]..[offsetn][block2, noffset]..[offsetn]
+ * the input data are in below form
  *
- * So the rules for storing data in this page is,
- * 1) If we can copy all the remaining data in this block then directly copy.
- * 2) Otherwise, copy them block by block so that we do page split at the
- *    correct point.
- * 3) So for page split if we can not copy all the offset of a particular block
- * in this page then if we can fit at least the block header + one offset in
- * this page then only we will split that block otherwise we will copy that
- * whole block data to the next page.  If we split we will update the noffsets
- * in the current block header and we will also return the prevblokhdr so that
- * when we will insert the remaining offsets of the splitted block that time
- * we insert the block header again.
+ * [DTS_BlockHeader1][offset array1][DTS_BlockHeader2][offset array2]...
+ *
+ * So if we can fit all the remaining data into this page then we don't need
+ * any manipulation and data can be copied as is.  But if we can not fit all
+ * the data into the current page then there is possibility of page split, that
+ * means we for some block header we might not be able to fit all the offset
+ * into the same page, so in that case we have to modify the block header and
+ * update the actuall offsets we can fit in this page and also we need to
+ * return prepare a block header which needs to be inserted into the next page.
  */
 static int
-dts_write_pagedata(Page	page, DTS_BlockHeader *prevblkhdr, char *data,
-				  int datasize)
+dts_prepare_pagedata(Page page, DTS_BlockHeader *prevblkhdr,
+					 DTS_BlockHeader *nextblkhdr, char *data, int datasize,
+					 int freespace, bool prevpagesplit, bool *pagesplit)
 {
-	PageHeader	phdr;
-	char   *pagedata;
-	int		freespace;
-	int		copysz = 0;
-	bool	prevheader = false;
-	bool	pagesplit = false;
-	DTS_BlockHeader *blkhdr = prevblkhdr;
-
-	phdr = (PageHeader) page;
-	pagedata = (char *) page + phdr->pd_lower;
-	freespace = PageGetExactFreeSpace(page);
+	DTS_BlockHeader	   *blkhdr = prevblkhdr;
+	int					copysz = 0;
 
 	/*
-	 * If previous block header is valid that mean there was a page split so
-	 * we need to add the block header again into the new page.
-	 */
-	if (BlockNumberIsValid(prevblkhdr->blkno))
-	{
-		Assert(freespace > DTS_MinCopySize);
-		memcpy(pagedata, prevblkhdr, sizeof(DTS_BlockHeader));
-		pagedata += sizeof(DTS_BlockHeader);
-		phdr->pd_lower += sizeof(DTS_BlockHeader);
-		prevheader = true;
-	}
-	/*
-	 * If we don't have enough space in the page to copy DTS_MinCopySize data
-	 * no point in copying anything to this page.
-	 */
-	else if (freespace < DTS_MinCopySize)
-		return 0;
-
-	/*
-	 * If we have enough freespace in the page then directly copy the data
-	 * into the page.
+	 * If we have enough freespace in the page then we can directly copy all
+	 * the data into the page.
 	 */
 	if (freespace >= datasize)
-	{
-		memcpy(pagedata, data, datasize);
-		phdr->pd_lower += datasize;
-
 		return datasize;
-	}
 
+	/*
+	 * There is no space to copy all the data into the current page so process
+	 * the data and check how much data we can copy into this page.  We can not
+	 * directly treat this as raw data because if there is any page split then
+	 * we will have to detect that and update the block header for the block
+	 * for which we detect the page split.
+	 */
 	while(1)
 	{
 		int		ncopyoffset = 0;
@@ -609,22 +643,29 @@ dts_write_pagedata(Page	page, DTS_BlockHeader *prevblkhdr, char *data,
 		if (freespace - copysz < DTS_MinCopySize)
 			break;
 
-		/* 
+		/*
 		 * After we have identified pagesplit we should not proceed to insert
 		 * more data in the same page.
 		 */
-		Assert(!pagesplit);
+		Assert(!(*pagesplit));
 
-		if (!prevheader)
+		/*
+		 * If we had the pagesplit the the caller would have already estimated
+		 * for that header because that header this an additional header which
+		 * is not part of the actual input data, otherwise estimate for the
+		 * header size.
+		 */
+		if (!prevpagesplit)
 		{
 			blkhdr = (DTS_BlockHeader *) (data + copysz);
 			copysz += sizeof(DTS_BlockHeader);
 		}
+		prevpagesplit = false;
 
 		/* Compute how many offset we can copy for this block. */
 		ncopyoffset = (freespace - copysz) / sizeof(OffsetNumber);
 
-		/* 
+		/*
 		 * If we can not copy all the offset of the block in the remaining
 		 * space then we get the page split and we need to reinsert this block
 		 * header again while inserting data into the next conveyor belt page.
@@ -632,28 +673,19 @@ dts_write_pagedata(Page	page, DTS_BlockHeader *prevblkhdr, char *data,
 		if (ncopyoffset < blkhdr->noffsets)
 		{
 			copysz += ncopyoffset * sizeof(OffsetNumber);
-			prevblkhdr->blkno = blkhdr->blkno;
+			nextblkhdr->blkno = blkhdr->blkno;
 
-			/* 
-			 * adjust the noffset in the current block header as well as for
-			 * the header we will insert into the new conveyor belt page. 
+			/*
+			 * Adjust the noffset in the current block header as well as for
+			 * the header we will insert into the new conveyor belt page.
 			 */
-			prevblkhdr->noffsets = blkhdr->noffsets - ncopyoffset;
+			nextblkhdr->noffsets = blkhdr->noffsets - ncopyoffset;
 			blkhdr->noffsets = ncopyoffset;
-			pagesplit = true;
+			*pagesplit = true;
 		}
 		else
 			copysz += blkhdr->noffsets * sizeof(OffsetNumber);
 	}
-
-	/* If there is no pagesplit then reset the prevblkhdr. */
-	if (!pagesplit)
-		prevblkhdr->blkno = InvalidBlockNumber;
-
-	memcpy(pagedata, data, copysz);
-	phdr->pd_lower += copysz;
-
-	Assert(phdr->pd_lower <= phdr->pd_upper);
 
 	return copysz;
 }
