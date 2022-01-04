@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include "access/brin_xlog.h"
+#include "access/cbxlog.h"
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/generic_xlog.h"
