@@ -1,0 +1,187 @@
+Conveyor Belt Storage
+=====================
+
+It's pretty common to want an append-only data store, but it's not usually
+practical to keep accumulating data forever without ever discarding any of
+it. What people most often want to do is periodically discard the oldest
+data, keeping all the newer stuff. Hence, imagine a conveyor belt. New data
+is continually added at one end of the conveyor belt, and eventually falls
+off the other end. Unlike a real conveyor belt, however, our conveyor belt
+is of variable length, and can grow and shrink to accommodate the amount of
+data that needs to be stored at any given time.
+
+Some other parts of PostgreSQL, for example xlog.c and slru.c, handle
+similar needs by using a series of files at the operating system level,
+adding new ones at the end and removing old ones. We want to use a standard
+relation fork, and so instead maintain a logical-to-physical page mapping.
+Callers allocate new logical page numbers (which are just consecutive 64-bit
+integers) and this module takes care of figuring out where to place them
+phyically. When the oldest logical pages are thrown away, the blocks
+allocated to them can be reused for new logical pages.
+
+Conceptually, a relation fork organized as a conveyor belt has three parts:
+
+- Payload. The payload is whatever data the user of this module wishes
+  to store. The conveyor belt doesn't care what you store in a payload page,
+  but it does require that you store something: each time a payload page is
+  initialized, it must end up with either pd_lower > SizeOfPageHeaderData,
+  or pd_upper < BLCKSZ.
+
+- Index. The index translates logical page numbers to physical block
+  numbers.  The intention is that pages might be physically relocated - e.g.
+  they could be moved to lower-numbered blocks to allow the relation to be
+  physically compacted - so external references to the data should use only
+  logical page numbers. The index is used to figure out which block
+  currently contains a given logical page number.
+
+- Freespace Map. The freespace map is used to decide where payload and
+  index data should be stored.
+
+Segments and the Freespace Map
+------------------------------
+
+Every page in a conveyor belt is either the metapage, or a freespace map
+page, or part of a segment. Segments can store either payload data or
+index data. Every segment in any particular conveyor belt contains
+the same number of pages. As old data is removed from the conveyor belt,
+segments get recycled.
+
+The allocation status of every segment is tracked by a single bit in the
+freespace map: 1 = allocated, 0 = free. The initial portion of the freespace
+map is stored in the metapage. When the relation has been extended far
+enough that there are no more bits available in the metapage to track the
+allocation status of further segments, a single freespace map page is
+inserted. That single freespace map page is then followed by additional
+segments. If we extend the relation far enough that the previous freespace
+map page has no more bits available to track the allocation status of
+further segments, then it's time to another freespace map page.
+
+This scheme allows us to compute the location of every freespace map page
+based on (1) the number of freespace bits in the metapage, (2) the
+number of freespace map bits in each freespace map page, and (3) the
+number of pages per segment. (1) and (2) are compile time constants, and
+(3) can't be changed after a conveyor belt is created, so once we have
+read the metapage for a conveyor belt once, we can compute the location
+of freespace map pages at will.
+
+It's also straightforward to compute the starting and ending block numbers
+for any given segment. We just have to be careful to account for the number
+of freespace map pages that precede that segment.
+
+Payload Segments and the Index
+------------------------------
+
+As payload data is added to a conveyor belt, payload segments are allocated
+to store it. As old payload data is removed from a conveyor belt, the
+payload segments that contain it can be deallocated and eventually reused.
+
+Because space for payload data is allocated a segment at a time, the
+index just needs to keep track of (1) the segment numbers that contain
+payload data, in order of allocation and (2) the starting logical page
+number for the first such segment. If there's not much data on the conveyor
+belt, all of these segment numbers - which we call index entries - can be
+stored in the metapage itself.
+
+If the metapage runs out of space to store index entries, then we move the
+oldest index entries that it presently contains into an index segment, and
+continue to insert new index entries into the metapage. The index segments
+themselves are organized into a singly linked list.
+
+As data is removed from a conveyor belt, we'll eventually reach a point
+where none of the index entries in a given index segment are needed any
+more. At that point, we can deallocate the index segment and reuse it.
+
+Note that nothing prevents a dealloated index segment from being reused
+as a payload segment, or the other way around.
+
+Removing Old Data
+-----------------
+
+From time to time, we expect to receive a request to discard old data,
+which will come in the form of a call to ConveyorBeltLogicalTruncate stating
+that all logical pages with page numbers less than some threshold value are
+no longer required. Thereafter, a subsequent call to ConveyorBeltVacuum
+may be used to free up any segments that are no longer required as a result
+of the increased logical truncation point. Finally, a call to
+ConveyorBeltPhysicalTruncate may be used to discard unused pages from the
+end of the relation.
+
+ConveyorBeltLogicalTruncate just updates the metapage with a new value for
+the oldest logical page in existence. Once this has been done, attempts to
+access logical pages prior to the new threshold will be categorically
+refused.  We require a cleanup lock on the matapage for this step.  This
+allows a reader which has determined the location of a payload page to
+release all buffer locks, retaining just a pin on the metapage, before
+reading and locking the target page. Since the page can't be logically
+truncated away while the pin on the metapage is held, it also can't be
+recycled.
+
+ConveyorBeltVacuum performs a multi-step process to recycle index and
+payload segments whose contents are no longer needed:
+
+1. If there are now one or more payload segments that contain no accessible
+   pages, it frees them up. To do this, it must first reinitialize each page of
+   each such segment, taking a cleanup lock on each page as it does so.
+   This guarantees that no other backend retains a pin on any such pages.
+   It should be impossible for any new locks or pins on these pages to be
+   taken at this point, because pages that have been logically truncated
+   can no longer be looked up via ConveyorBeltReadBuffer. It then clears
+   the index entry that points to the segment in question and simultaneously
+   marks it free in the freespace map.
+
+2. When all of the index entries in an index segment have been cleared,
+   the index segment itself can be freed. To do this, we first reinitialize
+   all the pages, and then update the metapage. The metapage update involves
+   changing metapage's notion of the oldest index segment and of the
+   logical page number where the index begins. Simultaneously, the segment
+   must be marked as free in the freespace map.
+
+   These metapage updates must be performed with a cleanup lock on the
+   metapage.  This allows a concurrent reader to lock the metapage, note the
+   location of the first index segment, release the lock on the metapage while
+   retaining the pin, and then go lock the pages in that index segment, or
+   successor index segments, without fearing that they will vanish.
+
+3. If index entries are cleared in the metapage itself, then any
+   remaining entries can be shifted to the start of the array of index
+   entries stored in the metapage, provided that we simultaneously
+   adjust the metapage's notion of the logical page number where the
+   index begins.
+
+Note that there's no correctness issue if ConveyorBeltVacuum is skipped or
+if it is interrupted before all the work that it could perform actually
+gets done. It doesn't do anything that can't be deferred until a later time;
+the only problem is that you might end up with a lot of bloat. That could
+be bad, but it's not a functional breakage.
+
+Note also that running multiple copies of ConveyorBeltVacuum on the same
+conveyor belt at the same time is a bad plan. They'll contend with each
+other trying to do the same work. Consider preventing this by some means
+(e.g. a self-exclusive heavyweight lock).
+
+ConveyorBeltPhysicalTruncate can be used to return disk space to the
+operating system. This only works if the highest-numbered segments happen
+to be free, and it requires both a relation extension lock (since it would
+be bad if someone is trying to make the relation longer while we're trying
+to make it shorter) and a cleanup lock on the metapage (since
+ConveyorBeltNewPage can't cope with a concurrent truncation; it expects
+that the relation will only grow concurrently, not shrink).
+
+Buffer Lock Ordering
+--------------------
+
+Various parts of the code need to acquire multiple buffer locks
+simultaneously, and must do so in a consistent order to avoid deadlock. We
+use this ordering:
+
+1. Any new page that we're about to allocate.
+2. Any payload page.
+3. Any index pages.
+4. Any FSM page.
+5. The metapage.
+
+It might seem strange to lock the metapage last, because we typically need
+to examine it before doing much of anything. However, after we examine it,
+we typically want to read other pages, and we don't want to retain the
+buffer lock while doing I/O.  Instead, we release the buffer lock and then
+reacquire it at the end, after we've got all the other locks we need.
