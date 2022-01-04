@@ -3780,3 +3780,11 @@ yyscan_t
 z_stream
 z_streamp
 zic_t
+cb_iseg_entry
+CBCache
+CBMetapageData
+CBPageNo
+CBSegNo
+ConveyorBelt
+xl_cb_allocate_index_segment
+xl_cb_allocate_payload_segment
