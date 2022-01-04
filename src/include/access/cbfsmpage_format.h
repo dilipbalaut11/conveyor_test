@@ -4,7 +4,7 @@
  *	  Actual on-disk format for a conveyor-belt FSM page.
  *
  * Backend code should not typically include this file directly, even if
- * it's code that is part of the conveyor belt implemenation. Instead, it
+ * it's code that is part of the conveyor belt implementation. Instead, it
  * should use the interface routines defined in cbfsmpage.h.
  *
  * See src/backend/access/conveyor/README for a general overview of

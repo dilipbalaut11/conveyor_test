@@ -304,8 +304,7 @@ cb_metapage_get_bounds(CBMetapageData *meta, CBPageNo *oldest_logical_page,
  * existing entries point to segments that are completely full. If we
  * needed to know how many entries had been filled in, whether or not any
  * of the associated storage was in use, we could do that by adding 1 to
- * the value computed here here if the entry at that offset is already
- * initialized.
+ * the value computed here if the entry at that offset is already initialized.
  */
 int
 cb_metapage_get_index_entries_used(CBMetapageData *meta)
@@ -552,7 +551,7 @@ cb_metapage_get_obsolete_state(CBMetapageData *meta,
 	 * of the index, or follows it by less than the number of pages per
 	 * segment. In the latter case, some but not all of the pages in the
 	 * oldest payload segment are obsolete. We can only clean up entire
-	 * payload semgents, so in such cases there is nothing to do.
+	 * payload segments, so in such cases there is nothing to do.
 	 */
 	if (istart + pps > olpage)
 		return CBM_OBSOLETE_NOTHING;
@@ -615,7 +614,7 @@ cb_metapage_clear_obsolete_index_entry(CBMetapageData *meta,
 									   CBSegNo segno,
 									   unsigned offset)
 {
-	if (meta->cbm_index[offset] != offset)
+	if (meta->cbm_index[offset] != segno)
 		elog(ERROR,
 			 "index entry at offset %u was expected to be %u but found %u",
 			 offset, segno, meta->cbm_index[offset]);
@@ -659,7 +658,7 @@ cb_metapage_get_fsm_bit(CBMetapageData *meta, CBSegNo segno)
 	uint8		byte;
 	uint8		mask;
 
-	if (segno >= CB_METAPAGE_FREESPACE_BYTES * BITS_PER_BYTE)
+	if (segno >= CB_FSM_SEGMENTS_FOR_METAPAGE)
 		elog(ERROR, "segment %u out of range for metapage fsm", segno);
 
 	byte = meta->cbm_freespace_map[segno / BITS_PER_BYTE];

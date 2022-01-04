@@ -9,7 +9,7 @@
  *
  * Copyright (c) 2016-2021, PostgreSQL Global Development Group
  *
- * src/backend/access/conveyor/cbmodify.c
+ * src/backend/access/conveyor/cbxlog.c
  *
  *-------------------------------------------------------------------------
  */

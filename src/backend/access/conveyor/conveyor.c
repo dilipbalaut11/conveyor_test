@@ -656,7 +656,7 @@ ConveyorBeltGetNewPage(ConveyorBelt *cb, CBPageNo *pageno)
 /*
  * Actually insert a new page into the conveyor belt.
  *
- * See ConveyorBeltGetNewPage for the intended usage of this fucntion.
+ * See ConveyorBeltGetNewPage for the intended usage of this function.
  */
 void
 ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer)
@@ -715,7 +715,7 @@ ConveyorBeltPerformInsert(ConveyorBelt *cb, Buffer buffer)
 /*
  * Clean up following the insertion of a new page into the conveyor belt.
  *
- * See ConveyorBeltGetNewPage for the intended usage of this fucntion.
+ * See ConveyorBeltGetNewPage for the intended usage of this function.
  */
 void
 ConveyorBeltCleanupInsert(ConveyorBelt *cb, Buffer buffer)
@@ -1050,7 +1050,7 @@ ConveyorBeltVacuum(ConveyorBelt *cb)
 
 		/*
 		 * If on the previous pass through the loop we concluded that we need
-		 * to free a payload segment refrenced by the metapage and if that no
+		 * to free a payload segment referenced by the metapage and if that no
 		 * longer seems like the thing we need to do, then release any lock and
 		 * pin we may have acquired in preparation for freeing that payload
 		 * segment.
@@ -1276,7 +1276,7 @@ ConveyorBeltClearIndexSegmentEntries(ConveyorBelt *cb, Buffer metabuffer,
 		{
 			if (segoff == 0)
 				elog(ERROR,
-					 "conveyor belt index page at segno %u offset 0 should be initialied",
+					 "conveyor belt index page at segno %u offset 0 should be initialized",
 					 index_segment);
 			if (*next_index_segment != CB_INVALID_SEGMENT)
 				elog(ERROR,
@@ -1432,7 +1432,7 @@ ConveyorBeltClearIndexSegmentEntries(ConveyorBelt *cb, Buffer metabuffer,
 }
 
 /*
- * Attempt to remve the oldest index segment.
+ * Attempt to remove the oldest index segment.
  *
  * The return value is the segment number of the oldest index segment that
  * remains after the operation has been completed. If no index segments remain
@@ -1960,7 +1960,7 @@ ConveyorSearchFSMPages(ConveyorBelt *cb, CBSegNo next_segment,
 		/*
 		 * Somehow this FSM page, which at last check was beyond the last
 		 * allocated segment, now has no bits free whatsoever.  Either we've
-		 * been asleep for an extrordinarily long time while a huge amount of
+		 * been asleep for an extraordinarily long time while a huge amount of
 		 * other work has happened, or the data on disk is corrupted, or
 		 * there's a bug.
 		 */

@@ -156,7 +156,7 @@ be bad, but it's not a functional breakage.
 
 Note also that running multiple copies of ConveyorBeltVacuum on the same
 conveyor belt at the same time is a bad plan. They'll contend with each
-othr trying to do the same work. Consider preventing this by some means
+other trying to do the same work. Consider preventing this by some means
 (e.g. a self-exclusive heavyweight lock).
 
 ConveyorBeltPhysicalTruncate can be used to return disk space to the
