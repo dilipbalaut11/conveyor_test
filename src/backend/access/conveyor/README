@@ -25,7 +25,7 @@ Conceptually, a relation fork organized as a conveyor belt has three parts:
   to store. The conveyor belt doesn't care what you store in a payload page,
   but it does require that you store something: each time a payload page is
   initialized, it must end up with either pd_lower > SizeOfPageHeaderData,
-  or pd_lower < BLCKSZ.
+  or pd_upper < BLCKSZ.
 
 - Index. The index translates logical page numbers to physical block
   numbers.  The intention is that pages might be physically relocated - e.g.
