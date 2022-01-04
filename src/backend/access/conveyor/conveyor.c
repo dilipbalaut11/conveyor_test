@@ -1282,6 +1282,7 @@ ConveyorBeltClearIndexSegmentEntries(ConveyorBelt *cb, Buffer metabuffer,
 				elog(ERROR,
 					 "non-final index segment page at segno %u offset %u should be initialized",
 					 index_segment, segoff);
+			UnlockReleaseBuffer(indexbuffer);
 			return true;
 		}
 
@@ -1302,8 +1303,9 @@ ConveyorBeltClearIndexSegmentEntries(ConveyorBelt *cb, Buffer metabuffer,
 		 * Loop over the index entries in this page.
 		 *
 		 * At the top of each iteration of the loop, the index page is
-		 * exclusively locked. The lock may be released and reacquired before
-		 * beginning the next iteration.
+		 * pinned and exclusively locked. The lock may be released and
+		 * reacquired before beginning the next iteration. The pin is retained
+		 * the whole time.
 		 */
 		while (pageoffset < CB_INDEXPAGE_INDEX_ENTRIES)
 		{
@@ -1316,7 +1318,6 @@ ConveyorBeltClearIndexSegmentEntries(ConveyorBelt *cb, Buffer metabuffer,
 			if (segno == CB_INVALID_SEGMENT)
 			{
 				/* No items remain in this page. */
-				UnlockReleaseBuffer(indexbuffer);
 				break;
 			}
 			if (first_page + (cb->cb_pages_per_segment * pageoffset) +
@@ -1422,6 +1423,9 @@ ConveyorBeltClearIndexSegmentEntries(ConveyorBelt *cb, Buffer metabuffer,
 			/* Now we're no longer prepared to clear any segment. */
 			cleared_segno = CB_INVALID_SEGMENT;
 		}
+
+		/* Release index page lock and pin. */
+		UnlockReleaseBuffer(indexbuffer);
 	}
 
 	return true;
@@ -1489,7 +1493,8 @@ ConveyorBeltFreeOldestIndexSegment(ConveyorBelt *cb, Buffer metabuffer,
 	 * any better.
 	 */
 	LockBuffer(firstindexbuffer, BUFFER_LOCK_EXCLUSIVE);
-	LockBuffer(fsmbuffer, BUFFER_LOCK_EXCLUSIVE);
+	if (fsmblock != InvalidBlockNumber)
+		LockBuffer(fsmbuffer, BUFFER_LOCK_EXCLUSIVE);
 	if (ConditionalLockBufferForCleanup(metabuffer))
 	{
 		oldest_remaining_index_segment =
