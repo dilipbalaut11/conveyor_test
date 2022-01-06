@@ -455,6 +455,8 @@ static void restore_vacuum_error_info(LVRelState *vacrel,
 static void lazy_init_vacrel(LVRelState *vacrel, BlockNumber nblocks);
 static void lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params);
 static void UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno);
+static void copy_deadtids_to_buffer(LVRelState *vacrel, BlockNumber blkno,
+									int noffsets,  OffsetNumber *offsets);
 
 /*
  *	heap_vacuum_rel() -- perform VACUUM for one heap relation
@@ -2087,10 +2089,19 @@ retry:
 		if (first_pass_only)
 		{
 			OffsetNumber	newdeadoffsets[MaxHeapTuplesPerPage];
-			DTS_BlockHeader	blkhdr;
 			int		noffsets = 0;
-			char   *data = vacrel->cbdata;
-			int		datasize;
+			int		ntotaloffset = 0;
+			char   *data = vacrel->cbdata + vacrel->cbdataoffset;
+			int		buffspaceleft;
+			bool	flushbuffer = false;
+
+			/*
+			 * If there is no sufficient space to hold the block header and
+			 * at least one offset for this block then flush the buffer.
+			 */
+			buffspaceleft = DTS_PageMaxDataSpace - vacrel->cbdataoffset;
+			if (buffspaceleft < DTS_MinCopySize)
+				flushbuffer = true;
 
 			/*
 			 * Before checking for the duplicate, make sure that the deadoffset
@@ -2100,48 +2111,59 @@ retry:
 
 			for (int i = 0; i < lpdead_items; i++)
 			{
+				/*
+				 * Check if we need to flush the buffer before further
+				 * processing then do so.
+				 */
+				if (flushbuffer)
+				{
+					/* Insert data into the conveyor belt. */
+					DTS_InsertDeadtids(vacrel->deadtidstate, vacrel->cbdata,
+									   vacrel->cbdataoffset);
+					vacrel->cbdataoffset = 0;
+					buffspaceleft = DTS_PageMaxDataSpace;
+					flushbuffer = false;
+					data = vacrel->cbdata;
+
+					/* Reset the buffer. */
+					memset(data, InvalidBlockNumber, DTS_PageMaxDataSpace);
+				}
+
+				/*
+				 * If the tid already exists in the conveyor belt then don't
+				 * add it again.
+				 */
 				if (!DTS_DeadtidExists(vacrel->deadtidstate, blkno, deadoffsets[i]))
+				{
 					newdeadoffsets[noffsets++] = deadoffsets[i];
+
+					/*
+					 * After including this offset, if there is no space in the
+					 * buffer for the next offset then we need to flush the
+					 * buffer to the conveyor belt, so copy the offsets to the
+					 * buffer and set the flushbuffer.
+					 */
+					if (buffspaceleft < DTS_BlkDataSize(noffsets + 1))
+					{
+						copy_deadtids_to_buffer(vacrel, blkno, noffsets,
+												newdeadoffsets);
+
+						/* Add the noffset balance to the total offset. */
+						ntotaloffset += noffsets;
+						noffsets = 0;
+						flushbuffer = true;
+					}
+				}
 			}
 
-			if (noffsets == 0)
-				goto exit;
-
-			/* 
-			 * Compute the data size for this block and check whether we have
-			 * enough space in the buffer for these data, if not then flush
-			 * the existing data and reinitalize the buffer.
-			 */
-			datasize = DTS_BlkDataSize(noffsets);
-			if (DTS_PageMaxDataSpace - vacrel->cbdataoffset < datasize)
+			/* Copy any remaining offsets to the buffer. */
+			if (noffsets > 0)
 			{
-				DTS_InsertDeadtids(vacrel->deadtidstate, data,
-								   vacrel->cbdataoffset);
-				vacrel->cbdataoffset = 0;
+				ntotaloffset += noffsets;
+				copy_deadtids_to_buffer(vacrel, blkno, noffsets,
+										newdeadoffsets);
+				vacrel->dead_items->num_items += ntotaloffset;
 			}
-
-			/*
-			 * If this is first time we are writing to this buffer then
-			 * intialize it.  We are going to process this buffer based on the
-			 * block header so intialize it wil InvalidBlockNumber.
-			 */
-			if (vacrel->cbdataoffset == 0)
-				memset(data, InvalidBlockNumber, DTS_PageMaxDataSpace);
-
-			data += vacrel->cbdataoffset;
-
-			/* 
-			 * Initialize the block header and copy the block header and
-			 * block's deadoffsets to the buffer.
-			 */
-			blkhdr.blkno = blkno;
-			blkhdr.noffsets = noffsets;
-			memcpy(data, &blkhdr, sizeof(DTS_BlockHeader));
-			data += sizeof(DTS_BlockHeader);
-			memcpy(data, newdeadoffsets, sizeof(OffsetNumber) * noffsets);
-			vacrel->cbdataoffset += datasize;
-
-			vacrel->dead_items->num_items += noffsets;
 		}
 		else
 		{
@@ -2163,7 +2185,6 @@ retry:
 									 vacrel->dead_items->num_items);
 	}
 
-exit:
 	/* Finally, add page-local counts to whole-VACUUM counts */
 	vacrel->tuples_deleted += tuples_deleted;
 	vacrel->lpdead_items += lpdead_items;
@@ -4738,4 +4759,19 @@ lazy_init_vacrel(LVRelState *vacrel, BlockNumber nblocks)
 	vacrel->new_dead_tuples = 0;
 	vacrel->num_tuples = 0;
 	vacrel->live_tuples = 0;
+}
+
+static void
+copy_deadtids_to_buffer(LVRelState *vacrel, BlockNumber blkno, int noffsets,
+						OffsetNumber *offsets)
+{
+	DTS_BlockHeader		blkhdr;
+	char			   *data = vacrel->cbdata + vacrel->cbdataoffset;
+	blkhdr.blkno = blkno;
+	blkhdr.noffsets = noffsets;
+
+	memcpy(data, &blkhdr, sizeof(DTS_BlockHeader));
+	data += sizeof(DTS_BlockHeader);
+	memcpy(data, offsets, sizeof(OffsetNumber) * noffsets);
+	vacrel->cbdataoffset += DTS_BlkDataSize(noffsets);
 }

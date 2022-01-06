@@ -42,6 +42,11 @@ typedef struct DTS_PageData
 		(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(DTS_PageData))
 #define DTS_BlkDataSize(noffset) \
 		sizeof(DTS_BlockHeader) + sizeof (OffsetNumber) * (noffset)
+/*
+ * We will copy the block data to the page iff the remaining space can fit
+ * the block header and at least one offset.
+ */
+#define DTS_MinCopySize	sizeof(DTS_BlockHeader) + sizeof(OffsetNumber)
 
 struct DTS_DeadTidState;
 typedef struct DTS_DeadTidState DTS_DeadTidState;
