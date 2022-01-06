@@ -113,12 +113,6 @@ struct DTS_DeadTidState
 	(DTS_BlockHeader *)(((char *)((runstate)->runcachedata)) + \
 						((run) * (sizeperrun) + (runstate)->runoffset[(run)]))
 
-/* 
- * We will copy the block data to the page iff the remaining space can fit
- * the block header and at least one offset.
- */
-#define DTS_MinCopySize	sizeof(DTS_BlockHeader) + sizeof(OffsetNumber)
-
 /* non-export function prototypes */
 static void dts_page_init(Page page);
 static int32 dts_offsetcmp(const void *a, const void *b);
@@ -177,21 +171,14 @@ DTS_InitDeadTidState(Relation rel)
 
 /*
  * DTS_InsertDeadtids() -- Insert given data into the conveyor belt.
- *
- * Input data is always in form of [DTS_BlockHeader][offset array].  So if
- * all the data are fitting into single conveyor belt we can directly copy the
- * data otherwise, we might have to modify some block header, for more detail
- * refer to the comments atop dts_write_pagedata() function.
  */
 void
 DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 {
 	ConveyorBelt	   *cb = deadtidstate->cb;
-	CBPageNo			pageno = deadtidstate->last_page;
-	DTS_BlockHeader		prevblkhdr;
-	bool				prevpagesplit = false;
+	CBPageNo			pageno;
 
-	/* Loop until we flush out all the data in the conveyor belt. */
+	/* Loop until we flush out all the data in to the conveyor belt. */
 	while(datasize > 0)
 	{
 		Buffer	buffer;
@@ -199,81 +186,19 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 		PageHeader	phdr;
 		char   *pagedata;
 		int		copysz = 0;
-		int		freespace;
-		bool	newpage = false;
-		bool	pagesplit = false;
-		DTS_BlockHeader		blkhdr;
 
-		/*
-		 * If we are starting a new run then start from a fresh conveyor belt
-		 * page, otherwise, continue writing into the previous page.  Even for
-		 * the new run we can start with the last used page but for simplicity
-		 * we might waste some space in page at the end of one complete vacuum
-		 * pass.  This way it would be easy to perform the index pass because
-		 * if we are not starting new run in the middle of the page we can
-		 * track the last vacuum point just by the conveyor belt pageno.
-		 */
-		if (deadtidstate->last_page != CB_INVALID_LOGICAL_PAGE)
-		{
-			pageno = deadtidstate->last_page;
-			buffer = ConveyorBeltReadBuffer(cb, pageno, BUFFER_LOCK_EXCLUSIVE,
-											NULL);
-			page = BufferGetPage(buffer);
-
-			/*
-			* If we don't have enough space in the page to copy DTS_MinCopySize data
-			* no point in copying anything to this page.
-			*/
-			freespace = PageGetExactFreeSpace(page);
-			if (freespace < DTS_MinCopySize)
-			{
-				UnlockReleaseBuffer(buffer);
-				deadtidstate->last_page = CB_INVALID_LOGICAL_PAGE;
-				continue;
-			}
-		}
-		else
-		{
-			newpage = true;
-			buffer = ConveyorBeltGetNewPage(cb, &pageno);
-			page = BufferGetPage(buffer);
-			dts_page_init(page);
-			freespace = PageGetExactFreeSpace(page);
-		}
+		buffer = ConveyorBeltGetNewPage(cb, &pageno);
+		page = BufferGetPage(buffer);
+		dts_page_init(page);
 
 		phdr = (PageHeader) page;
 		pagedata = (char *) page + phdr->pd_lower;
 
-		/* 
-		 * If there was page split in the previous insertion the keep the
-		 * space for inserting the block header into the new page.
-		 */
-		if (prevpagesplit)
-			freespace -= sizeof(DTS_BlockHeader);
-
-		/*
-		 * Prepare data for inserting into the current page, this will detect
-		 * how much data we can copy into this page, this will also take care
-		 * of manipulating the intermediate block header if there will be some
-		 * page split while copying into this page.
-		 */
-		copysz = dts_prepare_pagedata(page, &prevblkhdr, &blkhdr, data,
-									  datasize, freespace, prevpagesplit,
-									  &pagesplit);
-
 		START_CRIT_SECTION();
 
-		/*
-		 * If we had a page split while inserting into the previous page then
-		 * first insert the previous block header into this new page and then
-		 * start copying the remaining data.
-		 */
-		if (prevpagesplit)
-		{
-			memcpy(pagedata, &prevblkhdr, sizeof(DTS_BlockHeader));
-			pagedata += sizeof(DTS_BlockHeader);
-			phdr->pd_lower += sizeof(DTS_BlockHeader);
-		}
+		copysz = datasize;
+		if (copysz > DTS_PageMaxDataSpace)
+			copysz = DTS_PageMaxDataSpace;
 
 		/* Write data into the current page and update pd_lower. */
 		memcpy(pagedata, data, copysz);
@@ -282,16 +207,10 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 		Assert(phdr->pd_lower <= phdr->pd_upper);
 
 		/*
-		 * If we have added new page then add it to the conveyor belt this will
-		 * be WAL logged internally, otherwise if we have reused the previosuly
-		 * written page then WAL log it.
+		 * Add new page to the conveyor belt this will be WAL logged
+		 * internally.
 		 */
-		if (newpage)
-			ConveyorBeltPerformInsert(cb, buffer);
-		else
-		{
-			/* TODO: WAL log this operation. */
-		}
+		ConveyorBeltPerformInsert(cb, buffer);
 
 		END_CRIT_SECTION();
 
@@ -301,23 +220,11 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 		 */
 		data += copysz;
 		datasize -= copysz;
-
-		if (pagesplit)
-		{
-			prevblkhdr = blkhdr;
-			prevpagesplit = pagesplit;
-		}
-
-		if (newpage)
-			ConveyorBeltCleanupInsert(cb, buffer);
-		else
-			UnlockReleaseBuffer(buffer);
+		ConveyorBeltCleanupInsert(cb, buffer);
 
 		/* Set the start page for this run if not yet set. */
 		if (deadtidstate->start_page == CB_INVALID_LOGICAL_PAGE)
 			deadtidstate->start_page = pageno;
-
-		deadtidstate->last_page = CB_INVALID_LOGICAL_PAGE;
 	}
 
 	deadtidstate->last_page = pageno;
