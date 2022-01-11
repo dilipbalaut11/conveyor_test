@@ -129,7 +129,7 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 	TransactionId relminmxid BKI_DEFAULT(1);	/* FirstMultiXactId */
 
 	/* conveyor belt pageno upto which we have already vacuumed. */
-	int64		cbvacuumpage BKI_DEFAULT(-1);
+	int64		relvacuumpage BKI_DEFAULT(-1);
 
 #ifdef CATALOG_VARLEN			/* variable-length fields start here */
 	/* NOTE: These fields are not present in a relcache entry's rd_rel field. */
@@ -146,7 +146,7 @@ CATALOG(pg_class,1259,RelationRelationId) BKI_BOOTSTRAP BKI_ROWTYPE_OID(83,Relat
 
 /* Size of fixed part of pg_class tuples, not counting var-length fields */
 #define CLASS_TUPLE_SIZE \
-	 (offsetof(FormData_pg_class,cbvacuumpage) + sizeof(int64))
+	 (offsetof(FormData_pg_class,relvacuumpage) + sizeof(int64))
 
 /* ----------------
  *		Form_pg_class corresponds to a pointer to a tuple with

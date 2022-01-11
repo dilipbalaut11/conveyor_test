@@ -89,6 +89,7 @@ struct DTS_DeadTidState
 	ConveyorBelt   *cb;					/* conveyor belt reference.*/
 	CBPageNo		start_page;			/* start page for this run. */
 	CBPageNo		last_page;			/* last page for this run. */
+	CBPageNo		min_idxvac_page;	/* page upto which index vacuum done */
 
 	/* Below fields are for maintaning cache for duplicate check. */
 	bool			completed;			/* No more data to be loaded. */
@@ -113,16 +114,27 @@ struct DTS_DeadTidState
 	(DTS_BlockHeader *)(((char *)((runstate)->runcachedata)) + \
 						((run) * (sizeperrun) + (runstate)->runoffset[(run)]))
 
+/* 
+ * In OffsetNumber lower 15 bits for storing actual offset and 1 high bit for
+ * indicating whether index vacuum is done for this offset or not.
+ */
+#define DTS_OFFSET_BITS		15
+#define DTS_OFFSET_MASK		((((uint16) 1) << DTS_OFFSET_BITS) - 1)
+
+#define DTS_GET_OFFSET(offset)			((offset) & DTS_OFFSET_MASK)
+#define DTS_GET_INDEX_VAC_DONE(offset)	((offset) >> DTS_OFFSET_BITS)
+
+#define DTS_SET_OFFSET_INDEX_VACBIT(offset, off, indexvac) \
+	do { \
+		offset = (off) | ((uint16) (indexvac) << DTS_OFFSET_BITS); \
+	} while (0)
+
 /* non-export function prototypes */
 static void dts_page_init(Page page);
 static int32 dts_offsetcmp(const void *a, const void *b);
 static void dts_load_run(DTS_DeadTidState *deadtidstate, int run);
 static void dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno);
 static void dts_process_runs(DTS_DeadTidState *deadtidstate);
-static int dts_prepare_pagedata(Page page, DTS_BlockHeader *prevblkhdr,
-								DTS_BlockHeader *nextblkhdr, char *data,
-								int datasize, int freespace,
-								bool prevpagesplit, bool *pagesplit);
 static int dts_read_pagedata(Page page, ItemPointerData *deadtids,
 							 int maxtids);
 
@@ -133,11 +145,16 @@ static int dts_read_pagedata(Page page, ItemPointerData *deadtids,
  * tid store.
  */
 DTS_DeadTidState *
-DTS_InitDeadTidState(Relation rel)
+DTS_InitDeadTidState(Relation rel, int nindexes, Relation *indrels,
+					 CBPageNo *min_idxvac_page)
 {
-	DTS_DeadTidState   *deadtidstate;
-	ConveyorBelt	   *cb;
 	SMgrRelation		reln;
+	ConveyorBelt	   *cb;
+	DTS_DeadTidState   *deadtidstate;	
+	int			i;
+	CBPageNo	idxvac_page = CB_INVALID_LOGICAL_PAGE;
+	CBPageNo	oldest_pageno,
+				next_pageno;
 
 	/* Open the relation at smgr level. */
 	reln = RelationGetSmgr(rel);
@@ -166,6 +183,21 @@ DTS_InitDeadTidState(Relation rel)
 	deadtidstate->blkno = InvalidBlockNumber;
 	deadtidstate->completed = false;
 
+	for (i = 0; i < nindexes; i++)
+	{
+		if (idxvac_page == CB_INVALID_LOGICAL_PAGE ||
+			indrels[i]->rd_rel->relvacuumpage < idxvac_page)
+			idxvac_page = indrels[i]->rd_rel->relvacuumpage;
+	}
+
+	ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
+	if (idxvac_page != CB_INVALID_LOGICAL_PAGE && idxvac_page > oldest_pageno)
+		deadtidstate->min_idxvac_page = idxvac_page;
+	else
+		deadtidstate->min_idxvac_page = CB_INVALID_LOGICAL_PAGE;
+
+	if (min_idxvac_page != NULL)
+		*min_idxvac_page = idxvac_page;
 	return deadtidstate;
 }
 
@@ -338,8 +370,8 @@ DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate, CBPageNo from_pageno,
  * DTS_LoadDeadtids - load deadtid from conveyor belt into the cache.
  *
  * blkno - current heap block we are going to scan, so this function need to
- * ensure that we have all the dead tids loaded in the cache at least for
- * this heap block.
+ *		   ensure that we have all the dead tids loaded in the cache for this
+ *		   this heap block.
  */
 void
 DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
@@ -405,9 +437,12 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
  * 					   belt.
  */
 bool
+
 DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
-				  OffsetNumber offset)
+				  OffsetNumber offset, bool *setunused)
 {
+	OffsetNumber	*res;
+
 	if (deadtidstate == NULL)
 		return false;
 
@@ -415,9 +450,17 @@ DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 	if (deadtidstate->blkno != blkno)
 		return false;
 
-	return bsearch((void *) &offset, (void *) deadtidstate->offsets,
-				   deadtidstate->num_offsets, sizeof(OffsetNumber),
-				   dts_offsetcmp);
+	res = (OffsetNumber *) bsearch((void *) &offset,
+									(void *) deadtidstate->offsets,
+				   					deadtidstate->num_offsets,
+									sizeof(OffsetNumber),
+									dts_offsetcmp);
+	if (res == NULL)
+		return false;
+
+	*setunused = DTS_GET_INDEX_VAC_DONE(*res);
+
+	return true;
 }
 
 /*
@@ -446,6 +489,9 @@ DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
 	deadtidpd = (DTS_PageData *) PageGetSpecialPointer(page);
 	deadtidpd->nextrunpage = deadtidstate->last_page + 1;
 
+	if (deadtidstate->min_idxvac_page != CB_INVALID_LOGICAL_PAGE)
+		DTS_Vacuum(deadtidstate, deadtidstate->min_idxvac_page);
+
 	/* TODO - WAL log this operation*/
 	elog(LOG, "run complete setting next run page = "UINT64_FORMAT,
 		 deadtidpd->nextrunpage);
@@ -472,6 +518,12 @@ DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
 		pfree(deadtidstate->offsets);
 
 	pfree(deadtidstate);
+}
+
+CBPageNo
+DTS_GetIndexVacuumPage(DTS_DeadTidState	*deadtidstate)
+{
+	return deadtidstate->min_idxvac_page;
 }
 
 /*
@@ -502,99 +554,6 @@ dts_page_init(Page page)
 
 	/* Start writing data from the maxaligned offset. */
 	p->pd_lower = MAXALIGN(SizeOfPageHeaderData);
-}
-
-/*
- * dts_prepare_pagedata - prepare data to be inserted into the given conveyor
- * belt page.
- *
- * the input data are in below form
- *
- * [DTS_BlockHeader1][offset array1][DTS_BlockHeader2][offset array2]...
- *
- * So if we can fit all the remaining data into this page then we don't need
- * any manipulation and data can be copied as is.  But if we can not fit all
- * the data into the current page then there is possibility of page split, that
- * means we for some block header we might not be able to fit all the offset
- * into the same page, so in that case we have to modify the block header and
- * update the actuall offsets we can fit in this page and also we need to
- * return prepare a block header which needs to be inserted into the next page.
- */
-static int
-dts_prepare_pagedata(Page page, DTS_BlockHeader *prevblkhdr,
-					 DTS_BlockHeader *nextblkhdr, char *data, int datasize,
-					 int freespace, bool prevpagesplit, bool *pagesplit)
-{
-	DTS_BlockHeader	   *blkhdr = prevblkhdr;
-	int					copysz = 0;
-
-	/*
-	 * If we have enough freespace in the page then we can directly copy all
-	 * the data into the page.
-	 */
-	if (freespace >= datasize)
-		return datasize;
-
-	/*
-	 * There is no space to copy all the data into the current page so process
-	 * the data and check how much data we can copy into this page.  We can not
-	 * directly treat this as raw data because if there is any page split then
-	 * we will have to detect that and update the block header for the block
-	 * for which we detect the page split.
-	 */
-	while(1)
-	{
-		int		ncopyoffset = 0;
-
-		/* Stop if we can not copy block header and at least one offset. */
-		if (freespace - copysz < DTS_MinCopySize)
-			break;
-
-		/*
-		 * After we have identified pagesplit we should not proceed to insert
-		 * more data in the same page.
-		 */
-		Assert(!(*pagesplit));
-
-		/*
-		 * If we had the pagesplit the the caller would have already estimated
-		 * for that header because that header this an additional header which
-		 * is not part of the actual input data, otherwise estimate for the
-		 * header size.
-		 */
-		if (!prevpagesplit)
-		{
-			blkhdr = (DTS_BlockHeader *) (data + copysz);
-			copysz += sizeof(DTS_BlockHeader);
-		}
-		prevpagesplit = false;
-
-		/* Compute how many offset we can copy for this block. */
-		ncopyoffset = (freespace - copysz) / sizeof(OffsetNumber);
-
-		/*
-		 * If we can not copy all the offset of the block in the remaining
-		 * space then we get the page split and we need to reinsert this block
-		 * header again while inserting data into the next conveyor belt page.
-		 */
-		if (ncopyoffset < blkhdr->noffsets)
-		{
-			copysz += ncopyoffset * sizeof(OffsetNumber);
-			nextblkhdr->blkno = blkhdr->blkno;
-
-			/*
-			 * Adjust the noffset in the current block header as well as for
-			 * the header we will insert into the new conveyor belt page.
-			 */
-			nextblkhdr->noffsets = blkhdr->noffsets - ncopyoffset;
-			blkhdr->noffsets = ncopyoffset;
-			*pagesplit = true;
-		}
-		else
-			copysz += blkhdr->noffsets * sizeof(OffsetNumber);
-	}
-
-	return copysz;
 }
 
 /*
@@ -679,6 +638,8 @@ dts_offsetcmp(const void *a, const void *b)
 {
 	OffsetNumber offset1 = *((const OffsetNumber *) a);
 	OffsetNumber offset2 = *((const OffsetNumber *) b);
+
+	offset2 = DTS_GET_OFFSET(offset2);
 
 	if (offset1 < offset2)
 		return -1;
@@ -800,6 +761,7 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 	DTS_RunState	   *runstate = deadtidstate->deadtidrun;
 	DTS_BlockHeader	   *blkhdr;
 	OffsetNumber		smallestoffset = InvalidOffsetNumber;
+	CBPageNo			min_idxvac_page = deadtidstate->min_idxvac_page;
 	int		run;
 	int		smallestrun;
 	int		runsize;
@@ -924,7 +886,18 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 			runindex[smallestrun] = 0;
 		}
 
-		deadtidstate->offsets[noffsets] = smallestoffset;
+		/*
+		 * Store the offset and also set the bit that we have already done
+		 * index vacuum for this offset.
+		 */
+		if (min_idxvac_page != CB_INVALID_LOGICAL_PAGE &&
+			runstate->startpage[smallestrun + 1] <= min_idxvac_page)
+			DTS_SET_OFFSET_INDEX_VACBIT(deadtidstate->offsets[noffsets],
+										smallestoffset, 1);
+		else
+			DTS_SET_OFFSET_INDEX_VACBIT(deadtidstate->offsets[noffsets],
+										smallestoffset, 0);
+		
 		smallestoffset = InvalidOffsetNumber;
 		noffsets++;
 
@@ -956,6 +929,7 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 	CBPageNo	   *next_run_page;
 	int				maxrun;
 	int				nRunCount = 0;
+	int				nelement;
 
 	/* Get conveyor belt page bounds. */
 	ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
@@ -993,7 +967,7 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 		if (nextrunpage != CB_INVALID_LOGICAL_PAGE)
 		{
 			/* If current memory is not enough then resize it. */
-			if (nRunCount == maxrun)
+			if (nRunCount == maxrun - 1)
 			{
 				maxrun *= 2;
 				next_run_page = repalloc(next_run_page, maxrun * sizeof(CBPageNo));
@@ -1008,10 +982,18 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 
 	Assert(nRunCount > 0);
 
+	/*
+	 * We have the start page for each run and the end page can be computed
+	 * as the start page of the next run so only for the last run we need to
+	 * store one extra element which will be treated as a end page for the
+	 * last run.
+	 */
+	nelement = nRunCount + 1;
+	next_run_page[nRunCount] = curpageno;
 	deadtidrun->num_runs = nRunCount;
-	deadtidrun->startpage = palloc(nRunCount * sizeof(CBPageNo));
-	deadtidrun->nextpage = palloc(nRunCount * sizeof(CBPageNo));
-	deadtidrun->runoffset = palloc0(nRunCount * sizeof(int));
+	deadtidrun->startpage = palloc(nelement * sizeof(CBPageNo));
+	deadtidrun->nextpage = palloc(nelement * sizeof(CBPageNo));
+	deadtidrun->runoffset = palloc0(nelement * sizeof(int));
 
 	/*
 	 * Set startpage and next page for each run.  Initially both will be same
@@ -1019,7 +1001,7 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 	 * will move to the next page to be fetched from the conveyor belt
 	 * whereas the statspage will remain the same throughout the run.
 	 */
-	memcpy(deadtidrun->startpage, next_run_page, nRunCount * sizeof(CBPageNo));
-	memcpy(deadtidrun->nextpage, next_run_page, nRunCount * sizeof(CBPageNo));
+	memcpy(deadtidrun->startpage, next_run_page, nelement * sizeof(CBPageNo));
+	memcpy(deadtidrun->nextpage, next_run_page, nelement * sizeof(CBPageNo));
 	pfree(next_run_page);
 }
