@@ -978,7 +978,12 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 
 	/* Initialize deadtid state if doing only first pass vacuum. */
 	if (first_pass_only)
-		vacrel->deadtidstate = DTS_InitDeadTidState(vacrel->rel);
+	{
+		vacrel->deadtidstate = DTS_InitDeadTidState(vacrel->rel,
+													vacrel->nindexes,
+													vacrel->indrels,
+													NULL);
+	}
 
 	/*
 	 * Do failsafe precheck before calling dead_items_alloc.  This ensures
@@ -1637,7 +1642,15 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	 * state.
 	 */
 	if (params->options & VACOPT_FIRST_PASS)
+	{
+		CBPageNo	last_vacpage;
+
+		last_vacpage = DTS_GetIndexVacuumPage(vacrel->deadtidstate);
 		DTS_ReleaseDeadTidState(vacrel->deadtidstate);
+		if (last_vacpage != CB_INVALID_LOGICAL_PAGE)
+			UpdateRelationLastVaccumPage(RelationGetRelid(vacrel->rel),
+										 last_vacpage);
+	}
 
 	/*
 	 * Vacuum the remainder of the Free Space Map.  We must do this whether or
@@ -1752,7 +1765,9 @@ lazy_scan_prune(LVRelState *vacrel,
 				live_tuples;
 	int			nnewlpdead;
 	int			nfrozen;
+	int			nunused;
 	OffsetNumber deadoffsets[MaxHeapTuplesPerPage];
+	OffsetNumber unusedoffsets[MaxHeapTuplesPerPage];
 	xl_heap_freeze_tuple frozen[MaxHeapTuplesPerPage];
 
 	maxoff = PageGetMaxOffsetNumber(page);
@@ -1762,6 +1777,7 @@ retry:
 	/* Initialize (or reset) page-level counters */
 	tuples_deleted = 0;
 	lpdead_items = 0;
+	nunused = 0;
 	new_dead_tuples = 0;
 	num_tuples = 0;
 	live_tuples = 0;
@@ -1842,16 +1858,20 @@ retry:
 		 */
 		if (ItemIdIsDead(itemid))
 		{
+			bool setunused = false;
+
 			/*
 			 * If we are performing only the first pass of the vacuum and item
 			 * already present in the conveyor belt then nothing to be done.
 			 */
 			if (!first_pass || !DTS_DeadtidExists(vacrel->deadtidstate, blkno,
-												  offnum))
+												  offnum, &setunused))
 			{
 				deadoffsets[lpdead_items++] = offnum;
 				prunestate->has_lpdead_items = true;
 			}
+			else if (setunused)
+				unusedoffsets[nunused++] = offnum;
 
 			prunestate->all_visible = false;
 			continue;
@@ -2049,6 +2069,47 @@ retry:
 
 			recptr = log_heap_freeze(vacrel->rel, buf, vacrel->FreezeLimit,
 									 frozen, nfrozen);
+			PageSetLSN(page, recptr);
+		}
+		END_CRIT_SECTION();
+	}
+
+	if (nunused > 0)
+	{
+		START_CRIT_SECTION();
+
+		/* Mark collected items unused. */
+		for (int i = 0; i < nunused; i++)
+		{
+			itemid = PageGetItemId(page, unusedoffsets[i]);
+			ItemIdSetUnused(itemid);
+		}
+		
+		/* Attempt to truncate line pointer array now */
+		PageTruncateLinePointerArray(page);
+
+		/*
+		* Mark buffer dirty before we write WAL.
+		*/
+		MarkBufferDirty(buf);
+
+		/* XLOG stuff */
+		if (RelationNeedsWAL(vacrel->rel))
+		{
+			xl_heap_vacuum xlrec;
+			XLogRecPtr	recptr;
+
+			xlrec.nunused = nunused;
+
+			XLogBeginInsert();
+			XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
+
+			XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
+			XLogRegisterBufData(0, (char *) unusedoffsets,
+								nunused * sizeof(OffsetNumber));
+
+			recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);
+
 			PageSetLSN(page, recptr);
 		}
 
@@ -3161,7 +3222,7 @@ UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno)
 		elog(ERROR, "cache lookup failed for relation %u", relid);
 
 	/* Update pg_class tuple as appropriate. */
-	((Form_pg_class) GETSTRUCT(reltup))->cbvacuumpage = pageno;
+	((Form_pg_class) GETSTRUCT(reltup))->relvacuumpage = pageno;
 
 	CatalogTupleUpdate(pgclass, &reltup->t_self, reltup);
 
@@ -3218,12 +3279,12 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 								 PROGRESS_VACUUM_PHASE_VACUUM_INDEX);
 
 	/* Get the next cbpage from where we want to start vacuum. */
-	start_pageno = indrel->rd_rel->cbvacuumpage;
+	start_pageno = indrel->rd_rel->relvacuumpage;
 	if (start_pageno == CB_INVALID_LOGICAL_PAGE)
 		start_pageno = 0;
 
 	/* Initialize deadtid state. */
-	dts = DTS_InitDeadTidState(heaprel);
+	dts = DTS_InitDeadTidState(heaprel, 0, NULL, NULL);
 
 	/*
 	 * Loop until we complete the index vacuum.  Read tuples which can fit into
@@ -3290,7 +3351,6 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	CBPageNo	to_pageno = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	next_runpage = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	last_pageread;
-	int			i;
 	LVDeadItems		   *dead_items;
 	DTS_DeadTidState   *dts;
 
@@ -3308,28 +3368,18 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	dead_items = vacrel->dead_items;
 	vacrel->rel_pages = RelationGetNumberOfBlocks(vacrel->rel);
 
-	/*
-	 * Loop thorugh all the indexes and find out the minimum conveyor belt
-	 * pageno, upto which all the indexes have been vacuumed.
-	 */
-	for (i = 0; i < vacrel->nindexes; i++)
-	{
-		if (to_pageno == CB_INVALID_LOGICAL_PAGE ||
-			vacrel->indrels[i]->rd_rel->cbvacuumpage < to_pageno)
-			to_pageno = vacrel->indrels[i]->rd_rel->cbvacuumpage;
-	}
+	/* Initialize deadtid state. */
+	dts = DTS_InitDeadTidState(vacrel->rel, vacrel->nindexes, vacrel->indrels,
+							   &to_pageno);
 
 	/* Get the next cbpage from where we want to start vacuum. */
-	from_pageno = vacrel->rel->rd_rel->cbvacuumpage;
+	from_pageno = vacrel->rel->rd_rel->relvacuumpage;
 	if (from_pageno == CB_INVALID_LOGICAL_PAGE)
 		from_pageno = 0;
 
 	/* We have already done enough vacuum so nothing to be done. */
 	if (from_pageno == to_pageno || to_pageno == CB_INVALID_LOGICAL_PAGE)
 		return;
-
-	/* Initialize deadtid state. */
-	dts = DTS_InitDeadTidState(vacrel->rel);
 
 	/* Loop until we complete the heap vacuum. */
 	while(from_pageno < to_pageno)
