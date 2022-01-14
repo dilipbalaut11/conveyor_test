@@ -97,6 +97,9 @@ struct DTS_DeadTidState
 	BlockNumber		blkno;				/* current block number of the cached
 						   				   offsets */
 	OffsetNumber   *offsets;
+	bool		   *markunused;			/* Whether to mark a particular offset
+										   in above offset array as unused or
+										   not */
 	DTS_RunState   *deadtidrun;			/* dead tid run cache state. */
 };
 
@@ -113,21 +116,6 @@ struct DTS_DeadTidState
 #define DTS_GetRunBlkHdr(runstate, run, sizeperrun) \
 	(DTS_BlockHeader *)(((char *)((runstate)->runcachedata)) + \
 						((run) * (sizeperrun) + (runstate)->runoffset[(run)]))
-
-/* 
- * In OffsetNumber lower 15 bits for storing actual offset and 1 high bit for
- * indicating whether index vacuum is done for this offset or not.
- */
-#define DTS_OFFSET_BITS		15
-#define DTS_OFFSET_MASK		((((uint16) 1) << DTS_OFFSET_BITS) - 1)
-
-#define DTS_GET_OFFSET(offset)			((offset) & DTS_OFFSET_MASK)
-#define DTS_GET_INDEX_VAC_DONE(offset)	((offset) >> DTS_OFFSET_BITS)
-
-#define DTS_SET_OFFSET_INDEX_VACBIT(offset, off, indexvac) \
-	do { \
-		offset = (off) | ((uint16) (indexvac) << DTS_OFFSET_BITS); \
-	} while (0)
 
 /* non-export function prototypes */
 static void dts_page_init(Page page);
@@ -409,6 +397,8 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		/* Allocate space for dead offset cache. */
 		deadtidstate->offsets =
 		(OffsetNumber *) palloc0(MaxHeapTuplesPerPage * sizeof(OffsetNumber));
+		deadtidstate->markunused =
+						(bool *) palloc0(MaxHeapTuplesPerPage * sizeof(bool));
 
 		/*
 		 * Compute the number of runs available in the conveyor belt and check
@@ -458,7 +448,7 @@ DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 	if (res == NULL)
 		return false;
 
-	*setunused = DTS_GET_INDEX_VAC_DONE(*res);
+	*setunused = deadtidstate->markunused[res - deadtidstate->offsets];
 
 	return true;
 }
@@ -516,6 +506,8 @@ DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
 	}
 	if (deadtidstate->offsets)
 		pfree(deadtidstate->offsets);
+	if (deadtidstate->markunused)
+		pfree(deadtidstate->markunused);
 
 	pfree(deadtidstate);
 }
@@ -638,8 +630,6 @@ dts_offsetcmp(const void *a, const void *b)
 {
 	OffsetNumber offset1 = *((const OffsetNumber *) a);
 	OffsetNumber offset2 = *((const OffsetNumber *) b);
-
-	offset2 = DTS_GET_OFFSET(offset2);
 
 	if (offset1 < offset2)
 		return -1;
@@ -892,12 +882,11 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		 */
 		if (min_idxvac_page != CB_INVALID_LOGICAL_PAGE &&
 			runstate->startpage[smallestrun + 1] <= min_idxvac_page)
-			DTS_SET_OFFSET_INDEX_VACBIT(deadtidstate->offsets[noffsets],
-										smallestoffset, 1);
+			deadtidstate->markunused[noffsets] = true;
 		else
-			DTS_SET_OFFSET_INDEX_VACBIT(deadtidstate->offsets[noffsets],
-										smallestoffset, 0);
+			deadtidstate->markunused[noffsets] = false;
 		
+		deadtidstate->offsets[noffsets] = smallestoffset;
 		smallestoffset = InvalidOffsetNumber;
 		noffsets++;
 
