@@ -125,6 +125,65 @@ static void dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno);
 static void dts_process_runs(DTS_DeadTidState *deadtidstate);
 static int dts_read_pagedata(Page page, ItemPointerData *deadtids,
 							 int maxtids);
+static bool DTS_CheckPageData(Page page);
+static bool
+DTS_CheckPageData(Page page)
+{
+	PageHeader	phdr;
+	char   *pagedata;
+	int		nbyteread = 0;
+	DTS_BlockHeader *blkhdr;
+
+	phdr = (PageHeader) page;
+	pagedata = (char *) PageGetContents(page);;
+
+	/* Loop until we convert complete page. */
+	while(1)
+	{
+		OffsetNumber   *offsets;
+		int		i;
+
+		/*
+		 * While copying the data into the page we have ensure that we will
+		 * copy the block data to the page iff we can copy block header and
+		 * at least one offset, so based on the current nbyteread if writable
+		 * space of the page is not enough for that data then we can stop.
+		 */
+		if (DTS_PageMaxDataSpace - nbyteread < DTS_MinCopySize)
+			break;
+
+		/*
+		 * Read next block header, if the block header is not initialized i.e
+		 * both blkno and noffsets are 0 then we are done with this page.
+		 */
+		blkhdr = (DTS_BlockHeader *) (pagedata + nbyteread);
+		if (blkhdr->blkno == 0 && blkhdr->noffsets == 0)
+			break;
+
+		/*
+		 * Skip the block header so that we reach to the offset array for this
+		 * block number.
+		 */
+		nbyteread += sizeof(DTS_BlockHeader);
+		offsets = (OffsetNumber *) (pagedata + nbyteread);
+
+		/*
+		 * Use the same block number as in the block header and generate tid
+		 * w.r.t. each offset in the offset array.
+		 */
+		Assert(BlockNumberIsValid(blkhdr->blkno));
+		for (i = 0; i < blkhdr->noffsets; i++)
+			Assert(OffsetNumberIsValid(offsets[i]));
+
+		/*
+		 * Skip all the offset w.r.t. the current block so that we point to the
+		 * next block header in the page.
+		 */
+		nbyteread += (blkhdr->noffsets * sizeof(OffsetNumber));
+		Assert(nbyteread <= phdr->pd_lower);
+	}
+	return true;
+}
 
 /*
  * DTS_InitDeadTidState - intialize the deadtid state
@@ -193,13 +252,15 @@ DTS_InitDeadTidState(Relation rel, int nindexes, Relation *indrels,
  * DTS_InsertDeadtids() -- Insert given data into the conveyor belt.
  */
 void
-DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
+DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int *datasizes,
+				   int npages)
 {
-	ConveyorBelt	   *cb = deadtidstate->cb;
-	CBPageNo			pageno;
+	ConveyorBelt   *cb = deadtidstate->cb;
+	CBPageNo		pageno;
+	int				nwritten = 0;	
 
 	/* Loop until we flush out all the data in to the conveyor belt. */
-	while(datasize > 0)
+	while(nwritten < npages)
 	{
 		Buffer	buffer;
 		Page	page;
@@ -216,7 +277,7 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 
 		START_CRIT_SECTION();
 
-		copysz = datasize;
+		copysz = datasizes[nwritten];
 		if (copysz > DTS_PageMaxDataSpace)
 			copysz = DTS_PageMaxDataSpace;
 
@@ -234,12 +295,13 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int datasize)
 
 		END_CRIT_SECTION();
 
+		Assert(DTS_CheckPageData(page));
 		/*
 		 * Update the data pointer and the remaining size based on how much
 		 * data we have copied to this page.
 		 */
-		data += copysz;
-		datasize -= copysz;
+		data += DTS_PageMaxDataSpace;
+		nwritten++;
 		ConveyorBeltCleanupInsert(cb, buffer);
 
 		/* Set the start page for this run if not yet set. */
