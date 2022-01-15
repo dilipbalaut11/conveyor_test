@@ -42,6 +42,9 @@ typedef struct DTS_PageData
 		(BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - sizeof(DTS_PageData))
 #define DTS_BlkDataSize(noffset) \
 		sizeof(DTS_BlockHeader) + sizeof (OffsetNumber) * (noffset)
+#define DTS_FlushSize(nblocks, offset) \
+		(DTS_PageMaxDataSpace * (nblocks)) + (offset)
+
 /*
  * We will copy the block data to the page iff the remaining space can fit
  * the block header and at least one offset.
@@ -55,7 +58,7 @@ extern DTS_DeadTidState *DTS_InitDeadTidState(Relation rel, int nindexes,
 											  Relation *indrels,
 											  CBPageNo *min_idxvac_page);
 extern void DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data,
-							   int size);
+							   int *pdatasizes, int npages);
 extern int DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate,
 							CBPageNo from_pageno, CBPageNo to_pageno,
 							int maxtids, ItemPointerData *deadtids,
