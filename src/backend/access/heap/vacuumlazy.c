@@ -141,6 +141,9 @@
  */
 #define ParallelVacuumIsActive(vacrel) ((vacrel)->lps != NULL)
 
+#define	DEAD_OFFSET_NUM_PAGE	2
+#define DEAD_OFFSET_BUFSZ	DTS_PageMaxDataSpace * DEAD_OFFSET_NUM_PAGE
+
 /* Phases of vacuum during which we report error context. */
 typedef enum
 {
@@ -162,6 +165,12 @@ typedef enum
  */
 typedef struct LVDeadItems
 {
+	char		cbdata[DEAD_OFFSET_BUFSZ];  /* Block header and offsetarray
+											   to be flushed into the
+											   conveyor belt. */
+	int			cbdatasizes[DEAD_OFFSET_NUM_PAGE];
+	int			cbbuffno;		/* current write position in cbdata. */											  
+	int			cbdataoffset;	/* current write position in cbdata. */
 	int			max_items;		/* # slots allocated in array */
 	int			num_items;		/* current # of entries */
 
@@ -281,8 +290,6 @@ typedef struct LVParallelState
 	int			nindexes_parallel_condcleanup;
 } LVParallelState;
 
-#define	DEAD_OFFSET_NUM_PAGE	2
-#define DEAD_OFFSET_BUFSZ	DTS_PageMaxDataSpace * DEAD_OFFSET_NUM_PAGE
 typedef struct LVRelState
 {
 	/* Target heap relation and its indexes */
@@ -326,12 +333,6 @@ typedef struct LVRelState
 	/*
 	 * State managed by lazy_scan_heap() follows
 	 */
-	char		cbdata[DEAD_OFFSET_BUFSZ];  /* Block header and offsetarray
-											   to be flushed into the
-											   conveyor belt. */
-	int			cbdatasizes[DEAD_OFFSET_NUM_PAGE];
-	int			cbbuffno;		/* current write position in cbdata. */											  
-	int			cbdataoffset;	/* current write position in cbdata. */
 	LVDeadItems *dead_items;	/* TIDs whose index tuples we'll delete */
 	BlockNumber rel_pages;		/* total number of pages */
 	BlockNumber scanned_pages;	/* number of pages we examined */
@@ -461,7 +462,7 @@ static void lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params);
 static void UpdateRelationLastVaccumPage(Oid relid, CBPageNo pageno);
 static void store_deadtids(LVRelState *vacrel, BlockNumber blkno, int noffsets,
 						   OffsetNumber *offsets);
-static void copy_deadtids_to_buffer(LVRelState *vacrel, BlockNumber blkno,
+static void copy_deadtids_to_buffer(LVDeadItems *dead_items, BlockNumber blkno,
 									int noffsets,  OffsetNumber *offsets);
 
 /*
@@ -1631,14 +1632,17 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	/* Perform a final round of index and heap vacuuming */
 	if (dead_items->num_items > 0)
 	{
+		LVDeadItems *dead_items = vacrel->dead_items;
+
 		if (!first_pass_only)
 			lazy_vacuum(vacrel);
-		else if (vacrel->cbbuffno > 0 || vacrel->cbdataoffset > 0)
+		else if (dead_items->cbbuffno > 0 || dead_items->cbdataoffset > 0)
 		{
-			vacrel->cbdatasizes[vacrel->cbbuffno] = vacrel->cbdataoffset;
-			DTS_InsertDeadtids(vacrel->deadtidstate, vacrel->cbdata,
-							   vacrel->cbdatasizes, vacrel->cbbuffno + 1);
-			vacrel->dead_items->num_items = 0;
+			dead_items->cbdatasizes[dead_items->cbbuffno] = dead_items->cbdataoffset;
+			DTS_InsertDeadtids(vacrel->deadtidstate, dead_items->cbdata,
+							   dead_items->cbdatasizes,
+							   dead_items->cbbuffno + 1);
+			dead_items->num_items = 0;
 		}
 	}
 
@@ -3905,6 +3909,8 @@ dead_items_alloc(LVRelState *vacrel, int nworkers)
 	dead_items = (LVDeadItems *) palloc(max_items_to_alloc_size(max_items));
 	dead_items->max_items = max_items;
 	dead_items->num_items = 0;
+	dead_items->cbbuffno = 0;
+	dead_items->cbdataoffset = 0;
 
 	vacrel->dead_items = dead_items;
 }
@@ -4781,15 +4787,16 @@ store_deadtids(LVRelState *vacrel, BlockNumber blkno, int noffsets,
 	int		spaceleft;
 	int		copyoffsets = 0;
 	bool	switchbuffer = false;
+	LVDeadItems *dead_items = vacrel->dead_items;
 
 	/*
 	 * If we have sufficient space in the buffer to hold all the data then
 	 * copy the data into the buffer and return;
 	 */
-	spaceleft = DTS_PageMaxDataSpace - vacrel->cbdataoffset;
+	spaceleft = DTS_PageMaxDataSpace - dead_items->cbdataoffset;
 	if (spaceleft >= DTS_BlkDataSize(noffsets))
 	{
-		copy_deadtids_to_buffer(vacrel, blkno, noffsets, offsets);
+		copy_deadtids_to_buffer(dead_items, blkno, noffsets, offsets);
 		return;
 	}
 
@@ -4809,20 +4816,20 @@ store_deadtids(LVRelState *vacrel, BlockNumber blkno, int noffsets,
 		 */
 		if (switchbuffer)
 		{
-			vacrel->cbdatasizes[vacrel->cbbuffno] = vacrel->cbdataoffset;
-			if ((vacrel->cbbuffno + 1) == DEAD_OFFSET_NUM_PAGE)
+			dead_items->cbdatasizes[dead_items->cbbuffno] = dead_items->cbdataoffset;
+			if ((dead_items->cbbuffno + 1) == DEAD_OFFSET_NUM_PAGE)
 			{
-				DTS_InsertDeadtids(vacrel->deadtidstate, vacrel->cbdata,
-								   vacrel->cbdatasizes, vacrel->cbbuffno + 1);
-				vacrel->cbbuffno = 0;
+				DTS_InsertDeadtids(vacrel->deadtidstate, dead_items->cbdata,
+								   dead_items->cbdatasizes, dead_items->cbbuffno + 1);
+				dead_items->cbbuffno = 0;
 
 				/* Reset the buffer. */
-				memset(vacrel->cbdata, InvalidBlockNumber, DEAD_OFFSET_BUFSZ);
+				memset(dead_items->cbdata, InvalidBlockNumber, DEAD_OFFSET_BUFSZ);
 			}
 			else
-				vacrel->cbbuffno++;
+				dead_items->cbbuffno++;
 			
-			vacrel->cbdataoffset = 0;
+			dead_items->cbdataoffset = 0;
 			spaceleft = DTS_PageMaxDataSpace;
 			switchbuffer = false;
 		}
@@ -4830,7 +4837,7 @@ store_deadtids(LVRelState *vacrel, BlockNumber blkno, int noffsets,
 		copyoffsets =
 			(spaceleft - sizeof(DTS_BlockHeader)) / sizeof(OffsetNumber);
 		copyoffsets = Min(copyoffsets, noffsets);
-		copy_deadtids_to_buffer(vacrel, blkno, copyoffsets, offsets);
+		copy_deadtids_to_buffer(dead_items, blkno, copyoffsets, offsets);
 		noffsets -= copyoffsets;
 		offsets += copyoffsets;
 		switchbuffer = true;
@@ -4841,8 +4848,8 @@ store_deadtids(LVRelState *vacrel, BlockNumber blkno, int noffsets,
  * copy_deadtids_to_buffer - Helper function for flush_deadtids.
  */
 static void
-copy_deadtids_to_buffer(LVRelState *vacrel, BlockNumber blkno, int noffsets,
-						OffsetNumber *offsets)
+copy_deadtids_to_buffer(LVDeadItems *dead_items, BlockNumber blkno,
+						int noffsets, OffsetNumber *offsets)
 {
 	DTS_BlockHeader		blkhdr;
 	char			   *data;
@@ -4850,12 +4857,12 @@ copy_deadtids_to_buffer(LVRelState *vacrel, BlockNumber blkno, int noffsets,
 	blkhdr.blkno = blkno;
 	blkhdr.noffsets = noffsets;
 
-	data = vacrel->cbdata +
-			vacrel->cbbuffno * DTS_PageMaxDataSpace +
-			vacrel->cbdataoffset;
+	data = dead_items->cbdata +
+			dead_items->cbbuffno * DTS_PageMaxDataSpace +
+			dead_items->cbdataoffset;
 
 	memcpy(data, &blkhdr, sizeof(DTS_BlockHeader));
 	data += sizeof(DTS_BlockHeader);
 	memcpy(data, offsets, sizeof(OffsetNumber) * noffsets);
-	vacrel->cbdataoffset += DTS_BlkDataSize(noffsets);
+	dead_items->cbdataoffset += DTS_BlkDataSize(noffsets);
 }
