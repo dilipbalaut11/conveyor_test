@@ -54,9 +54,8 @@ typedef struct DTS_PageData
 struct DTS_DeadTidState;
 typedef struct DTS_DeadTidState DTS_DeadTidState;
 
-extern DTS_DeadTidState *DTS_InitDeadTidState(Relation rel, int nindexes,
-											  Relation *indrels,
-											  CBPageNo *min_idxvac_page);
+extern DTS_DeadTidState *DTS_InitDeadTidState(Relation rel,
+											  CBPageNo min_idxvac_page);
 extern void DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data,
 							   int *pdatasizes, int npages);
 extern int DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate,
@@ -69,7 +68,6 @@ extern bool DTS_DeadtidExists(DTS_DeadTidState *deadtidstate,
 							  BlockNumber blkno, OffsetNumber offset,
 							  bool *setunused);
 extern void DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate);
-extern CBPageNo DTS_GetIndexVacuumPage(DTS_DeadTidState	*deadtidstate);
 extern void DTS_Vacuum(DTS_DeadTidState	*deadtidstate, CBPageNo	pageno);
 
 #endif							/* DEADTIDSTORE_H */

@@ -946,6 +946,7 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		skipping_blocks;
 	bool		first_pass_only = (params->options & VACOPT_FIRST_PASS);
+	CBPageNo	min_idxvac_page = CB_INVALID_LOGICAL_PAGE;
 	StringInfoData buf;
 	const int	initprog_index[] = {
 		PROGRESS_VACUUM_PHASE,
@@ -984,10 +985,26 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	/* Initialize deadtid state if doing only first pass vacuum. */
 	if (first_pass_only)
 	{
+		int			i;
+
+		/*
+		* Process all the index and find out what is the lowest conveyor belt page
+		* upto which all the indexes for the given relation has been vacuumed.
+		*
+		* This will help us to identify that during the prune pass of the vacuum
+		* if some of the old item is already there in the conveyor belt and if
+		* index vacuum is also done for that then we can directly mark that item
+		* unused.
+		*/
+		for (i = 0; i < vacrel->nindexes; i++)
+		{
+			if (min_idxvac_page == CB_INVALID_LOGICAL_PAGE ||
+				vacrel->indrels[i]->rd_rel->relvacuumpage < min_idxvac_page)
+				min_idxvac_page = vacrel->indrels[i]->rd_rel->relvacuumpage;
+		}
+
 		vacrel->deadtidstate = DTS_InitDeadTidState(vacrel->rel,
-													vacrel->nindexes,
-													vacrel->indrels,
-													NULL);
+													min_idxvac_page);
 	}
 
 	/*
@@ -1647,18 +1664,20 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 	}
 
 	/*
-	 * First pass is complete so set the next run page and release the deadtid
-	 * state.
+	 * First pass is complete so release the deadtidstate and also the last
+	 * conveyor belt pageno upto which we have marked the item unused.
 	 */
-	if (params->options & VACOPT_FIRST_PASS)
+	if (vacrel->deadtidstate)
 	{
-		CBPageNo	last_vacpage;
-
-		last_vacpage = DTS_GetIndexVacuumPage(vacrel->deadtidstate);
 		DTS_ReleaseDeadTidState(vacrel->deadtidstate);
-		if (last_vacpage != CB_INVALID_LOGICAL_PAGE)
+
+		/*
+		 * If min_idxvac_page is not valid then we wouldn't have set any item
+		 * unused so no need to update the last vacuum page for the heap.
+		 */
+		if (min_idxvac_page != CB_INVALID_LOGICAL_PAGE)
 			UpdateRelationLastVaccumPage(RelationGetRelid(vacrel->rel),
-										 last_vacpage);
+										 min_idxvac_page);
 	}
 
 	/*
@@ -3293,7 +3312,7 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 		start_pageno = 0;
 
 	/* Initialize deadtid state. */
-	dts = DTS_InitDeadTidState(heaprel, 0, NULL, NULL);
+	dts = DTS_InitDeadTidState(heaprel, CB_INVALID_LOGICAL_PAGE);
 
 	/*
 	 * Loop until we complete the index vacuum.  Read tuples which can fit into
@@ -3356,6 +3375,7 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 static void
 lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 {
+	int			i;
 	CBPageNo	from_pageno;
 	CBPageNo	to_pageno = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	next_runpage = CB_INVALID_LOGICAL_PAGE;
@@ -3372,14 +3392,32 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	 */
 	lazy_init_vacrel(vacrel, InvalidBlockNumber);
 
-
+	/*
+	 * XXX Currently, we have to allocate the dead item array and while
+	 * reading from the conveyor belt we need to convert it to dead item array.
+	 * But later if we unify the format of storing the dead item irrespective
+	 * of whether we are doing phase by vacuum or conventional vacuum where we
+	 * perform all pass in on shot then we can avoid this conversion here.
+	 */
 	dead_items_alloc(vacrel, -1);
 	dead_items = vacrel->dead_items;
 	vacrel->rel_pages = RelationGetNumberOfBlocks(vacrel->rel);
 
+	/*
+	 * In order to identify the conveyor belt page upto which we have to do the
+	 * second heap pass, process all the index and find out what is the lowest
+	 * conveyor belt page upto which all the indexes for the given relation has
+	 * been vacuumed.
+	 */
+	for (i = 0; i < vacrel->nindexes; i++)
+	{
+		if (to_pageno == CB_INVALID_LOGICAL_PAGE ||
+			vacrel->indrels[i]->rd_rel->relvacuumpage < to_pageno)
+			to_pageno = vacrel->indrels[i]->rd_rel->relvacuumpage;
+	}
+
 	/* Initialize deadtid state. */
-	dts = DTS_InitDeadTidState(vacrel->rel, vacrel->nindexes, vacrel->indrels,
-							   &to_pageno);
+	dts = DTS_InitDeadTidState(vacrel->rel, CB_INVALID_LOGICAL_PAGE);
 
 	/* Get the next cbpage from where we want to start vacuum. */
 	from_pageno = vacrel->rel->rd_rel->relvacuumpage;
@@ -4822,9 +4860,6 @@ store_deadtids(LVRelState *vacrel, BlockNumber blkno, int noffsets,
 				DTS_InsertDeadtids(vacrel->deadtidstate, dead_items->cbdata,
 								   dead_items->cbdatasizes, dead_items->cbbuffno + 1);
 				dead_items->cbbuffno = 0;
-
-				/* Reset the buffer. */
-				memset(dead_items->cbdata, InvalidBlockNumber, DEAD_OFFSET_BUFSZ);
 			}
 			else
 				dead_items->cbbuffno++;

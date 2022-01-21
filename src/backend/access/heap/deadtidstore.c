@@ -129,14 +129,12 @@ struct DTS_DeadTidState
 };
 
 /*
- * DTS_GetRunBlkHdr -Get next block header in the given run.
+ * DTS_GetRunBlkHdr - Get next block header in the given run.
  *
  * DTS_RunState's runoffset point to the current block header for each run in
  * the runcache.  The data in the conveyor belt are always stored in form of
  * [DTS_BlockHeader][Offset array], and this runoffset will always move over
- * the block header, it will never point to any intermediate data.  So during
- * merge we need to maintain a local index over the offset array to know which
- * offset we are currently merging from each run.
+ * the block header, it will never point to any intermediate data.
  */
 #define DTS_GetRunBlkHdr(runstate, run, sizeperrun) \
 	(DTS_BlockHeader *)(((char *)((runstate)->cache)) + \
@@ -224,28 +222,27 @@ AssertCheckPageData(Page page)
 /*
  * DTS_InitDeadTidState - intialize the deadtid state
  *
- * This will maintain the current state of reading and writing from the dead
- * tid store.
+ * This create new deadtid fork for the given relation and initialize the
+ * conveyor belt.  The deadtid state will maintain the current state of
+ * insertion/read from the conveyor belt.
  */
 DTS_DeadTidState *
-DTS_InitDeadTidState(Relation rel, int nindexes, Relation *indrels,
-					 CBPageNo *min_idxvac_page)
+DTS_InitDeadTidState(Relation rel, CBPageNo min_idxvac_page)
 {
+	CBPageNo	oldest_pageno;
+	CBPageNo	next_pageno;
 	SMgrRelation		reln;
 	ConveyorBelt	   *cb;
-	DTS_DeadTidState   *deadtidstate;	
-	int			i;
-	CBPageNo	idxvac_page = CB_INVALID_LOGICAL_PAGE;
-	CBPageNo	oldest_pageno,
-				next_pageno;
+	DTS_DeadTidState   *deadtidstate;
 
 	/* Open the relation at smgr level. */
 	reln = RelationGetSmgr(rel);
 
+	/* Allocate memory for deadtidstate. */
 	deadtidstate = palloc0(sizeof(DTS_DeadTidState));
 
 	/*
-	 * If the dead_tid fork doesn't exist then create it and initialize the
+	 * If the DEADTID_FORKNUM doesn't exist then create it and initialize the
 	 * conveyor belt, otherwise just open the conveyor belt.
 	 */
 	if (!smgrexists(reln, DEADTID_FORKNUM))
@@ -253,38 +250,41 @@ DTS_InitDeadTidState(Relation rel, int nindexes, Relation *indrels,
 		smgrcreate(reln, DEADTID_FORKNUM, false);
 		cb = ConveyorBeltInitialize(rel,
 									DEADTID_FORKNUM,
-									1024,	/* What is the best value ?*/
+									1024,	/* XXX What is the best value ?*/
 									CurrentMemoryContext);
 	}
 	else
 		cb = ConveyorBeltOpen(rel, DEADTID_FORKNUM, CurrentMemoryContext);
 
+	/* Initialize the dead tid state. */
 	deadtidstate->cb = cb;
 	deadtidstate->start_page = CB_INVALID_LOGICAL_PAGE;
 	deadtidstate->last_page = CB_INVALID_LOGICAL_PAGE;
 	deadtidstate->num_offsets = -1;
 	deadtidstate->completed = false;
 
-	for (i = 0; i < nindexes; i++)
-	{
-		if (idxvac_page == CB_INVALID_LOGICAL_PAGE ||
-			indrels[i]->rd_rel->relvacuumpage < idxvac_page)
-			idxvac_page = indrels[i]->rd_rel->relvacuumpage;
-	}
-
 	ConveyorBeltGetBounds(cb, &oldest_pageno, &next_pageno);
-	if (idxvac_page != CB_INVALID_LOGICAL_PAGE && idxvac_page > oldest_pageno)
-		deadtidstate->min_idxvac_page = idxvac_page;
+
+	if (min_idxvac_page != CB_INVALID_LOGICAL_PAGE &&
+		min_idxvac_page > oldest_pageno)
+		deadtidstate->min_idxvac_page = min_idxvac_page;
 	else
 		deadtidstate->min_idxvac_page = CB_INVALID_LOGICAL_PAGE;
 
-	if (min_idxvac_page != NULL)
-		*min_idxvac_page = idxvac_page;
 	return deadtidstate;
 }
 
 /*
  * DTS_InsertDeadtids() -- Insert given data into the conveyor belt.
+ *
+ * 'data' is data to be inserted into the conveyor belt and this data is
+ * in multiple of conveyor belt pages. The 'npages' tell us actuall how many
+ * pages to be inserted and 'datasizes' is bytes to be inserted into each
+ * page.  We should know exactly how many valid bytes are copied into each
+ * conveyor belt page so that we can set proper value for the pd_lower.  We
+ * to do that because in dts_load_run we copy data from multiple pages into
+ * cache and we don't want there to be any gap between the data and for that
+ * we need to know the exact size of valid data.
  */
 void
 DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int *datasizes,
@@ -294,7 +294,7 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int *datasizes,
 	CBPageNo		pageno;
 	int				nwritten = 0;	
 
-	/* Loop until we flush out all the data in to the conveyor belt. */
+	/* Loop until we write all the pages in to the conveyor belt. */
 	while(nwritten < npages)
 	{
 		Buffer	buffer;
@@ -303,6 +303,7 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int *datasizes,
 		char   *pagedata;
 		int		copysz = 0;
 
+		/* Get a new page from the conveyor belt. */
 		buffer = ConveyorBeltGetNewPage(cb, &pageno);
 		page = BufferGetPage(buffer);
 		dts_page_init(page);
@@ -351,12 +352,14 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int *datasizes,
 /*
  * DTS_ReadDeadtids - Read dead tids from the conveyor belt
  *
- * from_pageno - Conveyor belt page number from where we want to start
- * to_pageno - Conveyor belt page number upto which we want to read
- * deadtids - Pre allocated array for holding the dead tids, the allocated size
- * is sufficient to hold maxtids.
- * *last_pageread - Store last page number we have read from coveyor belt.
- * *next_runpage - Start page of the next vacuum run.
+ * 'from_pageno' is the conveyor belt page number from where we want to start
+ * and the 'to_pageno' upto which we want to read.
+ * 'deadtids' is pre allocated array for holding the dead tids, the allocated
+ * size is sufficient to hold 'maxtids'.
+ *
+ * On successfull read last page number we have read from coveyor belt will be
+ * stored into the '*last_pageread' and the first page of the next run will
+ * be stored into the '*next_runpage'
  *
  * Returns number of dead tids actually read from the conveyor belt.  Should
  * always be <= maxtids.
@@ -453,11 +456,14 @@ DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate, CBPageNo from_pageno,
 }
 
 /*
- * DTS_LoadDeadtids - load deadtid from conveyor belt into the cache.
+ * DTS_LoadDeadtids - Load dead offset from conveyor belt for given block.
  *
- * blkno - current heap block we are going to scan, so this function need to
- *		   ensure that we have all the dead tids loaded in the cache for this
- *		   this heap block.
+ * 'blkno' is current heap block we are going to scan, so this function need to
+ * ensure that we have all the previous dead offsets loaded into the cache for
+ * for this block from the conveyor belt.
+ *
+ * This is to ensure that when we are adding dead tids to the conveyor belt
+ * we don't add the duplicate tids.
  */
 void
 DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
@@ -522,9 +528,12 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 /*
  * DTS_DeadtidExists - check whether the offset already exists in conveyor
  * 					   belt.
+ * Returns true if the offset for the given block is already present in the
+ * conveyor belt.  Also set the '*setunused' flag to true if index vacuum
+ * is also done for this, that mean the caller can directly mark this item
+ * as unused.
  */
 bool
-
 DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 				  OffsetNumber offset, bool *setunused)
 {
@@ -551,8 +560,11 @@ DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 }
 
 /*
- * DTS_ReleaseDeadTidState - Cleanup the deadtid state and also set the next
- * 							 vacuum run page in the conveyor belt
+ * DTS_ReleaseDeadTidState - Release the dead tid state.
+ *
+ * Release memory for the deadtid state and its members.  This also mark the
+ * current vacuum run is complete by setting the last page of this run into the
+ * first page of this run.
  */
 void
 DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
@@ -576,6 +588,11 @@ DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
 	deadtidpd = (DTS_PageData *) PageGetSpecialPointer(page);
 	deadtidpd->nextrunpage = deadtidstate->last_page + 1;
 
+	/*
+	 * If min_idxvac_page is valid then we must have marked the offset unused
+	 * upto this page along with pruning so we can vacuum the conveyor belt
+	 * as well.
+	 */
 	if (deadtidstate->min_idxvac_page != CB_INVALID_LOGICAL_PAGE)
 		DTS_Vacuum(deadtidstate, deadtidstate->min_idxvac_page);
 
@@ -607,12 +624,6 @@ DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
 		pfree(deadtidstate->cansetunused);
 
 	pfree(deadtidstate);
-}
-
-CBPageNo
-DTS_GetIndexVacuumPage(DTS_DeadTidState	*deadtidstate)
-{
-	return deadtidstate->min_idxvac_page;
 }
 
 /*
