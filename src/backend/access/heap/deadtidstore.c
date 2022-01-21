@@ -1,12 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * deadtidstore.c
- *	  Store and fetch deadtids.
+ *	  Wrapper over conveyor belt to store and fetch deadtids.
  *
  * Create dead tid fork and manage storing and retriving deadtids using
  * conveyor belt infrastructure.
- *
- * Copyright (c) 2016-2021, PostgreSQL Global Development Group
  *
  * src/backend/access/conveyor/deadtidstore.c
  *
@@ -14,39 +12,36 @@
  */
 #include "postgres.h"
 
-#include <math.h>
-
 #include "access/conveyor.h"
 #include "access/deadtidstore.h"
 #include "access/htup_details.h"
 #include "miscadmin.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
-#include "utils/rel.h"
 #include "utils/memutils.h"
-
+#include "utils/rel.h"
 
 /*
  * Whenever we perform the first pass of the vacuum we flush the deadoffsets to
  * the conveyor belt multiple times, but the complete pass over the heap is
- * considered as a single run in the conveyor belt and all the tids of a single
- * run is in sorted order because during vacuum we scan and prune the heap in
- * the block order.
+ * considered as a single vacuum run in the conveyor belt and all the tids of a
+ * single run is in sorted order because during vacuum we scan and prune the
+ * heap in the block order.
  *
  * So while performing the first vacuum pass it is also possible that we
- * encounter the same deadtid again which we already added in on of the
- * previous vacuum run.  But there is no way to identify whether that is
- * already there in the conveyor or not except for checking it in the conveyor
- * belt it self.
- *
- * However the whole conveyor belt data might not fit into the maintence work
- * mem and that makes it difficult to search individual tid in the conveyor
- * belt.  But since we know the fact that the individual runs in the conveyor
+ * encounter the same deadtid again which we already inserted into the conveyor
+ * belt in one of the previous vacuum run.  But there is no way to identify
+ * whether that is already there in the conveyor or not except for checking it
+ * in the conveyor belt it self.  However the whole conveyor belt data might
+ * not fit into the maintence_work_mem and that makes it difficult to search
+ * individual tid in the conveyor belt.
+ * 
+ * But since we know the fact that the individual vacuum runs in the conveyor
  * belt are sorted so we can perform a merge over each run in order to generate
  * a sorted data.  For that we maintain a cache over each run and pull a couple
  * of pages in the cache from each run and then merge them into a block-level
  * cache.  The block-level cache is a very small cache that only holds the
- * offset for the current block we are going to prune.
+ * offset for the current block which we are going to prune in the vacuum.
  *
  * This data structure maintains the current state of the cache over the
  * previous vacuum runs.
@@ -74,33 +69,63 @@ typedef struct DTS_RunState
 	/* Next logical conveyor belt pageno to load for each run. */
 	CBPageNo   *nextpage;
 
-	/* block header, offset cache for each runs. */
-	char	   *runcachedata;
+	/*
+	 * Cache for the vacuum runs,  this is equally divided among all the runs.
+	 *
+	 * XXX this could be optimized such that instead of equally dividing we can
+	 * maintain some offset for each run inside this cache so we don't consume
+	 * equal space if some run are really small and don't need that much space.
+	 */
+	char	   *cache;
 } DTS_RunState;
 
 /*
  * This maintains the state over the conveyor belt for a single vacuum pass.
  * This tracks the start and last page of the conveyor belt for the current run
  * and at the end of the current run, the last page will be updated in the
- * special space of the first page of the run.
+ * special space of the first page of the run so that we knows the boundary for
+ * each vacuum run in the conveyor belt.
  */
 struct DTS_DeadTidState
 {
-	ConveyorBelt   *cb;					/* conveyor belt reference.*/
-	CBPageNo		start_page;			/* start page for this run. */
-	CBPageNo		last_page;			/* last page for this run. */
-	CBPageNo		min_idxvac_page;	/* page upto which index vacuum done */
+	/* conveyor belt reference.*/
+	ConveyorBelt   *cb;
+
+	/* start page for this run. */
+	CBPageNo		start_page;
+
+	/* last page for this run. */
+	CBPageNo		last_page;
+
+	/*
+	 * Conveyor belt logical page upto which index vacuum done for all the
+	 * indexes.
+	 */
+	CBPageNo		min_idxvac_page;
 
 	/* Below fields are for maintaning cache for duplicate check. */
-	bool			completed;			/* No more data to be loaded. */
-	int				num_offsets;		/* number of of dead offsets. */
-	BlockNumber		blkno;				/* current block number of the cached
-						   				   offsets */
+
+	/* no more data to be loaded. */
+	bool			completed;
+
+	/* number of sorted dead offsets for one block. */
+	int			num_offsets;
+
+	/* sorted dead offset cache for the one block. */
 	OffsetNumber   *offsets;
-	bool		   *markunused;			/* Whether to mark a particular offset
-										   in above offset array as unused or
-										   not */
-	DTS_RunState   *deadtidrun;			/* dead tid run cache state. */
+
+	/*
+	 * Whether to mark a particular offset in above offset array as unused or
+	 * not.  Basically we know the last logical conveyor belt pageno for each
+	 * vacuum run and while merging the runs we also know that the particular
+	 * offset is coming from which run.  So that time if the last page of the
+	 * run is smaller than then minimum index vacuum page then we mark this
+	 * true, false otherwise.
+	 */
+	bool		*cansetunused;
+
+	/* dead tid run cache state. */
+	DTS_RunState   *deadtidrun;
 };
 
 /*
@@ -114,7 +139,7 @@ struct DTS_DeadTidState
  * offset we are currently merging from each run.
  */
 #define DTS_GetRunBlkHdr(runstate, run, sizeperrun) \
-	(DTS_BlockHeader *)(((char *)((runstate)->runcachedata)) + \
+	(DTS_BlockHeader *)(((char *)((runstate)->cache)) + \
 						((run) * (sizeperrun) + (runstate)->runoffset[(run)]))
 
 /* non-export function prototypes */
@@ -125,10 +150,21 @@ static void dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno);
 static void dts_process_runs(DTS_DeadTidState *deadtidstate);
 static int dts_read_pagedata(Page page, ItemPointerData *deadtids,
 							 int maxtids);
-static bool DTS_CheckPageData(Page page);
-static bool
-DTS_CheckPageData(Page page)
+static void AssertCheckPageData(Page page);
+
+/*
+ * AssertCheckPageData
+ *		Verify whether the page data format.
+ *
+ * Check whether all page data are written proper format i.e.
+ * [Block Header][Offset Array] and all boundries are sane.
+ *
+ * No-op if assertions are not in use.
+ */
+static void
+AssertCheckPageData(Page page)
 {
+#ifdef USE_ASSERT_CHECKING
 	PageHeader	phdr;
 	char   *pagedata;
 	int		nbyteread = 0;
@@ -182,7 +218,7 @@ DTS_CheckPageData(Page page)
 		nbyteread += (blkhdr->noffsets * sizeof(OffsetNumber));
 		Assert(nbyteread <= phdr->pd_lower);
 	}
-	return true;
+#endif
 }
 
 /*
@@ -227,7 +263,6 @@ DTS_InitDeadTidState(Relation rel, int nindexes, Relation *indrels,
 	deadtidstate->start_page = CB_INVALID_LOGICAL_PAGE;
 	deadtidstate->last_page = CB_INVALID_LOGICAL_PAGE;
 	deadtidstate->num_offsets = -1;
-	deadtidstate->blkno = InvalidBlockNumber;
 	deadtidstate->completed = false;
 
 	for (i = 0; i < nindexes; i++)
@@ -295,7 +330,8 @@ DTS_InsertDeadtids(DTS_DeadTidState *deadtidstate, char *data, int *datasizes,
 
 		END_CRIT_SECTION();
 
-		Assert(DTS_CheckPageData(page));
+		AssertCheckPageData(page);
+
 		/*
 		 * Update the data pointer and the remaining size based on how much
 		 * data we have copied to this page.
@@ -449,7 +485,12 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 	 */
 	if ((oldest_pageno == next_pageno) ||
 		(oldest_pageno == deadtidstate->start_page))
+	{
+		deadtidstate->completed = true;
+		deadtidstate->num_offsets = 0;
+
 		return;
+	}
 
 	/* If deadtid cache is not yet intialize then do it now. */
 	if (deadtidstate->num_offsets == -1)
@@ -459,7 +500,7 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		/* Allocate space for dead offset cache. */
 		deadtidstate->offsets =
 		(OffsetNumber *) palloc0(MaxHeapTuplesPerPage * sizeof(OffsetNumber));
-		deadtidstate->markunused =
+		deadtidstate->cansetunused =
 						(bool *) palloc0(MaxHeapTuplesPerPage * sizeof(bool));
 
 		/*
@@ -474,14 +515,8 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		dts_process_runs(deadtidstate);
 	}
 
-	/*
-	 * Check either we have no dead offset loaded in the cache or the current
-	 * block number in the dead offset cache and the block is smaller than the
-	 * block we are processing now then load the data for the next block.
-	 */
-	if (!BlockNumberIsValid(deadtidstate->blkno) ||
-		deadtidstate->blkno < blkno)
-		dts_merge_runs(deadtidstate, blkno);
+	/* Merge dead tids for the input block. */
+	dts_merge_runs(deadtidstate, blkno);
 }
 
 /*
@@ -499,7 +534,7 @@ DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 		return false;
 
 	/* No data to be compared for this block then just return. */
-	if (deadtidstate->blkno != blkno)
+	if (deadtidstate->num_offsets == 0)
 		return false;
 
 	res = (OffsetNumber *) bsearch((void *) &offset,
@@ -510,7 +545,7 @@ DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 	if (res == NULL)
 		return false;
 
-	*setunused = deadtidstate->markunused[res - deadtidstate->offsets];
+	*setunused = deadtidstate->cansetunused[res - deadtidstate->offsets];
 
 	return true;
 }
@@ -555,8 +590,8 @@ DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
 	{
 		DTS_RunState   *deadtidrun = deadtidstate->deadtidrun;
 
-		if (deadtidrun->runcachedata != NULL)
-			pfree(deadtidrun->runcachedata);
+		if (deadtidrun->cache != NULL)
+			pfree(deadtidrun->cache);
 		if (deadtidrun->startpage != NULL)
 			pfree(deadtidrun->startpage);
 		if (deadtidrun->nextpage != NULL)
@@ -568,8 +603,8 @@ DTS_ReleaseDeadTidState(DTS_DeadTidState *deadtidstate)
 	}
 	if (deadtidstate->offsets)
 		pfree(deadtidstate->offsets);
-	if (deadtidstate->markunused)
-		pfree(deadtidstate->markunused);
+	if (deadtidstate->cansetunused)
+		pfree(deadtidstate->cansetunused);
 
 	pfree(deadtidstate);
 }
@@ -746,7 +781,7 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
 		endpage = next_pageno;
 
 	/* make cache to point to the current run's space. */
-	cache = runstate->runcachedata + runsize * run;
+	cache = runstate->cache + runsize * run;
 	memset(cache, 0, runsize);
 
 	while(nremaining > 0 && from_pageno < endpage)
@@ -944,9 +979,9 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		 */
 		if (min_idxvac_page != CB_INVALID_LOGICAL_PAGE &&
 			runstate->startpage[smallestrun + 1] <= min_idxvac_page)
-			deadtidstate->markunused[noffsets] = true;
+			deadtidstate->cansetunused[noffsets] = true;
 		else
-			deadtidstate->markunused[noffsets] = false;
+			deadtidstate->cansetunused[noffsets] = false;
 		
 		deadtidstate->offsets[noffsets] = smallestoffset;
 		smallestoffset = InvalidOffsetNumber;
@@ -961,7 +996,6 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 
 	pfree(runindex);
 	deadtidstate->num_offsets = noffsets;
-	deadtidstate->blkno = blkno;
 	deadtidstate->completed = nopendingdata;
 }
 
@@ -993,7 +1027,7 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 	 */
 	maxrun = 1000;
 	next_run_page = palloc(maxrun * sizeof(CBPageNo));
-	deadtidrun->runcachedata = palloc0(deadtidrun->cachesize);
+	deadtidrun->cache = palloc0(deadtidrun->cachesize);
 
 	/* Read page from the conveyor belt. */
 	while(curpageno < next_pageno)
