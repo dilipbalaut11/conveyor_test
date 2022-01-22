@@ -140,6 +140,9 @@ struct DTS_DeadTidState
 	(DTS_BlockHeader *)(((char *)((runstate)->cache)) + \
 						((run) * (sizeperrun) + (runstate)->runoffset[(run)]))
 
+/* Initial number of vacuum runs in the conveyor belt. */
+#define DTS_NUM_VACUUM_RUN		100
+
 /* non-export function prototypes */
 static void dts_page_init(Page page);
 static int32 dts_offsetcmp(const void *a, const void *b);
@@ -510,9 +513,8 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 						(bool *) palloc0(MaxHeapTuplesPerPage * sizeof(bool));
 
 		/*
-		 * Compute the number of runs available in the conveyor belt and check
-		 * whether we have enough cache to load at least one block from each
-		 * run, if so then we can peroform in-memory merge of the runs.
+		 * Compute the number of vacuum runs available in the conveyor belt and
+		 * also get the start conveyor belt pageno for each run.
 		 */
 		deadtidstate->deadtidrun = palloc0(sizeof(DTS_RunState));
 		cachesize = Min(maintenance_work_mem * 1024, MaxAllocSize);
@@ -521,7 +523,10 @@ DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		dts_process_runs(deadtidstate);
 	}
 
-	/* Merge dead tids for the input block. */
+	/* 
+	 * Read data from different vacuum run cache and merge into a sorted offset
+	 * array for given 'blkno'.
+	 */
 	dts_merge_runs(deadtidstate, blkno);
 }
 
@@ -852,6 +857,11 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
  *
  * Pass through each vacuum run in the conveyor belt and load a few blocks from
  * starting of each block based on the cache size.
+ *
+ * On return this will have all the offset for given 'blkno' stored into the
+ * 'deadtidstate->offsets' array in sorted order.  And this will also mark
+ * 'deadtidstate->cansetunused' flag w.r.t each offset indicating whether the
+ * index pass is already done for this or not.
  */
 static void
 dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
@@ -885,12 +895,15 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 
 	/*
 	 * Maintain a local index for each run, this tracks which offset currently
-	 * we are merging for each run within the current block header, as soon as
-	 * we go to the next block header we will reset it.  For more details refer
-	 * comment atop DTS_GetRunBlkHdr macro.
+	 * we are merging for each run within the current block header offset
+	 * array, as soon as we go to the next block header we will reset it.
 	 */
 	runindex = palloc0(sizeof(int) * runstate->num_runs);
 
+	/* 
+	 * Loop untill we fetch all the deadoffset from the conveyor belt for the
+	 * input blkno.
+	 */
 	while (1)
 	{
 		for (run = 0; run < runstate->num_runs; run++)
@@ -904,11 +917,13 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 			nopendingdata = false;
 
 			/*
-			 * Make sure that before we start merging offsets from this block
-			 * the run is pointing to the block header of the block we are
-			 * currently interested in.  If block no is already higher then the
-			 * blkno that means this run might not have any data for this block
-			 * so don't process this run further.
+			 * Make sure that before we start merging offsets from this run,
+			 * the run is pointing to the right block header.  If block no is
+			 * of the block header already higher than the input blkno that
+			 * means this run might not have more data for this block so don't
+			 * process this run further.  If block header is for smaller block
+			 * than we are looking for one or it is uninitialized then move
+			 * until we reach to the right block header.
 			 */
 			while (blkhdr->blkno < blkno ||
 				   (blkhdr->blkno == 0 && blkhdr->noffsets == 0))
@@ -924,6 +939,7 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 				 * If the current block header shows 0 offsets that means we
 				 * have reached to the end of the cached data for this run so
 				 * pull more data for this run from the conveyor belt.
+				 * Otherwise, Move runoffset to point to the next block header.
 				 */
 				if (blkhdr->noffsets == 0)
 				{
@@ -931,22 +947,28 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 					runindex[run] = 0;
 				}
 				else
-				{
-					/* Move runoffset to point to the next block header. */
-					runoffset[run] += sizeof(DTS_BlockHeader);
-					runoffset[run] += blkhdr->noffsets * sizeof(OffsetNumber);
-				}
+					runoffset[smallestrun] +=
+										DTS_BlkDataSize(blkhdr->noffsets);
 
+				/* Fetch the current block header from the run. */
 				blkhdr = DTS_GetRunBlkHdr(runstate, run, runsize);
 			}
 
-			if (blkhdr->noffsets != 0 && blkhdr->blkno == blkno)
+			/* We have found a matching block header. */
+			if (blkhdr->blkno == blkno)
 			{
+				/* Block header can not be with 0 offsets. */
+				Assert(blkhdr->noffsets != 0);
+
 				/* Skip block header to point to the first offset. */
-				nextoffset = (OffsetNumber *)(blkhdr + 1);
+				nextoffset = (OffsetNumber *)
+								((char *) blkhdr + sizeof(DTS_BlockHeader));
 				nextoffset += runindex[run];
 
-				/* Set the smallest tid. */
+				/*
+				 * Set the smallest offset and remember the run from which we
+				 * got the smallest offset.
+				 */
 				if (!(OffsetNumberIsValid(smallestoffset)) ||
 					*nextoffset < smallestoffset)
 				{
@@ -963,6 +985,7 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		if (!OffsetNumberIsValid(smallestoffset))
 			break;
 
+		/* Fetch block header from the current position of the run. */
 		blkhdr = DTS_GetRunBlkHdr(runstate, smallestrun, runsize);
 
 		/*
@@ -979,22 +1002,21 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		 */
 		if (runindex[smallestrun] >= blkhdr->noffsets)
 		{
-			runoffset[smallestrun] += sizeof(DTS_BlockHeader);
-			runoffset[smallestrun] += blkhdr->noffsets * sizeof(OffsetNumber);
+			runoffset[smallestrun] += DTS_BlkDataSize(blkhdr->noffsets);
 			runindex[smallestrun] = 0;
 		}
 
 		/*
-		 * Store the offset and also set the bit that we have already done
-		 * index vacuum for this offset.
+		 * Store the offset and also set a flag that whether we have already
+		 * done index vacuum for this offset or not.
 		 */
+		deadtidstate->offsets[noffsets] = smallestoffset;
 		if (min_idxvac_page != CB_INVALID_LOGICAL_PAGE &&
 			runstate->startpage[smallestrun + 1] <= min_idxvac_page)
 			deadtidstate->cansetunused[noffsets] = true;
 		else
 			deadtidstate->cansetunused[noffsets] = false;
 		
-		deadtidstate->offsets[noffsets] = smallestoffset;
 		smallestoffset = InvalidOffsetNumber;
 		noffsets++;
 
@@ -1005,14 +1027,23 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 		Assert(noffsets <= MaxHeapTuplesPerPage);
 	}
 
-	pfree(runindex);
+	/*
+	 * Store number of offset into the the deadtidstate and also mark it
+	 * completed if we have processed all the data from the conveyor belt.
+	 */
 	deadtidstate->num_offsets = noffsets;
 	deadtidstate->completed = nopendingdata;
+
+	/* Cleanup. */
+	pfree(runindex);
 }
 
 /*
- * dts_process_runs - Compute number of vacuums runs in conveyor belt and
- * 					  remember the start pageno of each run.
+ * dts_process_runs - Compute number of vacuums runs in conveyor belt.
+ * 
+ * Pass over the vacuum run in the conveyor belt and remember the start page
+ * for each vacuum run.  Later dts_load_run() will maintain cache over each
+ * run and pull the data from each run as and when needed.
  */
 static void
 dts_process_runs(DTS_DeadTidState *deadtidstate)
@@ -1033,14 +1064,20 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 
 	/*
 	 * Allocate next_run_page, this will hold the next page to load from each
-	 * run.  Initially start with some number and while processing the run
-	 * if the number of runs are more that this value then expand the memory.
+	 * run.  Initially start with DTS_NUM_VACUUM_RUN and while processing the
+	 * runs, if the number of runs are more that this value then expand the
+	 * memory.
 	 */
-	maxrun = 1000;
+	maxrun = DTS_NUM_VACUUM_RUN;
 	next_run_page = palloc(maxrun * sizeof(CBPageNo));
 	deadtidrun->cache = palloc0(deadtidrun->cachesize);
 
-	/* Read page from the conveyor belt. */
+	/*
+	 * Read page from the conveyor belt.
+	 *
+	 * TODO: this conveyor belt reading logic is duplicated in multiple
+	 * functions with some minor differences so this could be unified.
+	 */
 	while(curpageno < next_pageno)
 	{
 		DTS_PageData   *deadtidpd;
@@ -1066,9 +1103,11 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 			if (nRunCount == maxrun - 1)
 			{
 				maxrun *= 2;
-				next_run_page = repalloc(next_run_page, maxrun * sizeof(CBPageNo));
+				next_run_page = repalloc(next_run_page,
+										 maxrun * sizeof(CBPageNo));
 			}
 
+			/* Remember the start page of the current run. */
 			next_run_page[nRunCount++] = curpageno;
 			curpageno = nextrunpage;
 		}
@@ -1076,6 +1115,11 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 			break;
 	}
 
+	/* 
+	 * If we are in this function we must have at least one previous vacuum
+	 * run, otherwise caller shouldn't have exited before only based on
+	 * conveyor belt page bounds.
+	 */
 	Assert(nRunCount > 0);
 
 	/*
@@ -1093,9 +1137,9 @@ dts_process_runs(DTS_DeadTidState *deadtidstate)
 
 	/*
 	 * Set startpage and next page for each run.  Initially both will be same
-	 * but as we pull tid from the conveyor belt the nextpage for each run
-	 * will move to the next page to be fetched from the conveyor belt
-	 * whereas the statspage will remain the same throughout the run.
+	 * but as we pull data from the conveyor belt the nextpage for each run
+	 * will move to the next page to be fetched from the conveyor belt whereas
+	 * the startpage will remain the same throughout complete vacuum pass.
 	 */
 	memcpy(deadtidrun->startpage, next_run_page, nelement * sizeof(CBPageNo));
 	memcpy(deadtidrun->nextpage, next_run_page, nelement * sizeof(CBPageNo));
