@@ -48,35 +48,34 @@
  */
 typedef struct DTS_RunState
 {
-	/* Total number of previous runs in the conveyor belt. */
 	int		num_runs;
 
 	/*
-	 * Total cache size for storing the run data.  This size will be equally
-	 * divided among the runs.
+	 * Current position of each run w.r.t the conveyor belt.
+	 *
+	 * startpage keep accound for the first conveyor belt pageno and the
+	 * nextpage keep account for the next page to be fetched from the conveyor
+	 * belt for each run.
 	 */
-	Size	cachesize;
-
-	/*
-	 * During merge of each run, this maintains the current offset in to the
-	 * cache for each runs.
-	 */
-	int		   *runoffset;
-
-	/* Starting logical conveyor belt pageno for each run. */
 	CBPageNo   *startpage;
-
-	/* Next logical conveyor belt pageno to load for each run. */
 	CBPageNo   *nextpage;
 
 	/*
-	 * Cache for the vacuum runs,  this is equally divided among all the runs.
+	 * Cache information over each run.
 	 *
-	 * XXX this could be optimized such that instead of equally dividing we can
-	 * maintain some offset for each run inside this cache so we don't consume
+	 * runoffset maintain the current offset into the cache over each run.
+	 * We do not maintain the exact offset in this instead we keep the offset
+	 * of the next block header.  And for fetching the offsets within a block
+	 * header we use a local index.  Total size of the cache is stored in
+	 * cachesize and the cache is the actual cache holds data from each run.
+	 * This cache is equally divided among all runs.  However this could be
+	 * ptimized such that instead of equally dividing we can maintain some
+	 * offset for each run inside this cache so we don't consume
 	 * equal space if some run are really small and don't need that much space.
 	 */
-	char	   *cache;
+	int	   *runoffset;
+	Size	cachesize;
+	char   *cache;
 } DTS_RunState;
 
 /*
@@ -88,43 +87,49 @@ typedef struct DTS_RunState
  */
 struct DTS_DeadTidState
 {
-	/* conveyor belt reference.*/
+	/* Conveyor belt reference. */
 	ConveyorBelt   *cb;
 
-	/* start page for this run. */
-	CBPageNo		start_page;
-
-	/* last page for this run. */
-	CBPageNo		last_page;
-
 	/*
-	 * Conveyor belt logical page upto which index vacuum done for all the
-	 * indexes.
+	 * Current vacuum tracking
+	 *
+	 * During prune vacuum pass we can flush the dead tids to the conveyor belt
+	 * in multiple small check.  So the start_page remember what is the first
+	 * conveyor belt pageno where we started flushing and the last_page keep
+	 * track of the last conveyor belt into which we flushed.  At the end of
+	 * the vacuum pass we will set the last_page into the special space of the
+	 * first page for marking the vacuum run boundary.  Minimum conveyor belt
+	 * pageno upto which vacuum is done for all indexes is stored into
+	 * min_idxvac_page, so that during prune phase if we identify that some
+	 * items are already there in the conveyor belt and the index vacuum is
+	 * also done the we mark that item unused as well.
 	 */
+	CBPageNo		start_page;
+	CBPageNo		last_page;
 	CBPageNo		min_idxvac_page;
 
-	/* Below fields are for maintaning cache for duplicate check. */
-
-	/* no more data to be loaded. */
-	bool			completed;
-
-	/* number of sorted dead offsets for one block. */
-	int			num_offsets;
-
-	/* sorted dead offset cache for the one block. */
-	OffsetNumber   *offsets;
-
 	/*
-	 * Whether to mark a particular offset in above offset array as unused or
-	 * not.  Basically we know the last logical conveyor belt pageno for each
-	 * vacuum run and while merging the runs we also know that the particular
-	 * offset is coming from which run.  So that time if the last page of the
-	 * run is smaller than then minimum index vacuum page then we mark this
-	 * true, false otherwise.
+	 * Members for maintaning cache for duplicate check.
+	 *
+	 * completed is mark true if there is no more data to be fetched from the
+	 * deadtidrun cache, and num_offsets is the number dead offset loaded
+	 * into the offsets array.  We don't need to maintain the block number
+	 * because in this cache at a time we holds offsets only for a single
+	 * block.
+	 *
+	 * cansetunused keep a flag w.r.t each offset in the offsets array that a
+	 * particular offset can be set unused or not.  Basically we know the last
+	 * logical conveyor belt pageno for each vacuum run and while merging the
+	 * runs we also know that the particular offset is coming from which run.
+	 * So that time if the last page of the run is smaller than then minimum
+	 * index vacuum page then we mark this true, false otherwise.
 	 */
-	bool		*cansetunused;
+	bool			completed;
+	int				num_offsets;
+	OffsetNumber   *offsets;
+	bool		   *cansetunused;
 
-	/* dead tid run cache state. */
+	/* Dead tid run cache state. */
 	DTS_RunState   *deadtidrun;
 };
 
