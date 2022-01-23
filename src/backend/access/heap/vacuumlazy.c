@@ -4889,7 +4889,7 @@ copy_deadtids_to_buffer(LVDeadItems *dead_items, BlockNumber blkno,
 	DTS_BlockHeader		blkhdr;
 	char			   *data;
 
-	blkhdr.blkno = blkno;
+	BlockIdSet(&blkhdr.blkid, blkno);
 	blkhdr.noffsets = noffsets;
 
 	data = dead_items->cbdata +

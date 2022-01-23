@@ -24,12 +24,13 @@
  * whenever we are going for index vacuum we can convert it back to the dead
  * tid array.  So instead of converting it right after pruning each page
  * as we are doing it now we will delay it until we are not going for index
- * vacuum.
+ * vacuum.  Instead of BlockNumber we use BlockIdData to avoid alignment
+ * padding.
  */
 typedef struct DTS_BlockHeader
 {
-	BlockNumber		blkno;
-	int				noffsets;
+	BlockIdData		blkid;
+	uint16			noffsets;
 } DTS_BlockHeader;
 
 /* Next run page number in the special space. */

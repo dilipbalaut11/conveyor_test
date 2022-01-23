@@ -178,6 +178,7 @@ AssertCheckPageData(Page page)
 	while(1)
 	{
 		OffsetNumber   *offsets;
+		BlockNumber		blkno;
 		int		i;
 
 		/*
@@ -194,7 +195,8 @@ AssertCheckPageData(Page page)
 		 * both blkno and noffsets are 0 then we are done with this page.
 		 */
 		blkhdr = (DTS_BlockHeader *) (pagedata + nbyteread);
-		if (blkhdr->blkno == 0 && blkhdr->noffsets == 0)
+		blkno = BlockIdGetBlockNumber(&blkhdr->blkid);
+		if (blkno == 0 && blkhdr->noffsets == 0)
 			break;
 
 		/*
@@ -208,7 +210,7 @@ AssertCheckPageData(Page page)
 		 * Use the same block number as in the block header and generate tid
 		 * w.r.t. each offset in the offset array.
 		 */
-		Assert(BlockNumberIsValid(blkhdr->blkno));
+		Assert(BlockNumberIsValid(blkno));
 		for (i = 0; i < blkhdr->noffsets; i++)
 			Assert(OffsetNumberIsValid(offsets[i]));
 
@@ -682,6 +684,7 @@ dts_read_pagedata(Page page, ItemPointerData *deadtids, int maxtids)
 	{
 		ItemPointerData tmp;
 		OffsetNumber   *offsets;
+		BlockNumber		blkno;
 		int		i;
 
 		/*
@@ -698,7 +701,8 @@ dts_read_pagedata(Page page, ItemPointerData *deadtids, int maxtids)
 		 * both blkno and noffsets are 0 then we are done with this page.
 		 */
 		blkhdr = (DTS_BlockHeader *) (pagedata + nbyteread);
-		if (blkhdr->blkno == 0 && blkhdr->noffsets == 0)
+		blkno = BlockIdGetBlockNumber(&blkhdr->blkid);
+		if (blkno == 0 && blkhdr->noffsets == 0)
 			break;
 
 		/* 
@@ -712,7 +716,7 @@ dts_read_pagedata(Page page, ItemPointerData *deadtids, int maxtids)
 		 * Use the same block number as in the block header and generate tid
 		 * w.r.t. each offset in the offset array.
 		 */
-		ItemPointerSetBlockNumber(&tmp, blkhdr->blkno);
+		ItemPointerSetBlockNumber(&tmp, blkno);
 		for (i = 0; i < blkhdr->noffsets; i++)
 		{
 			ItemPointerSetOffsetNumber(&tmp, offsets[i]);
@@ -864,7 +868,7 @@ dts_load_run(DTS_DeadTidState *deadtidstate, int run)
  * index pass is already done for this or not.
  */
 static void
-dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
+dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber targetblk)
 {
 	DTS_RunState	   *runstate = deadtidstate->deadtidrun;
 	DTS_BlockHeader	   *blkhdr;
@@ -908,25 +912,27 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 	{
 		for (run = 0; run < runstate->num_runs; run++)
 		{
-			DTS_BlockHeader	*blkhdr = DTS_GetRunBlkHdr(runstate, run, runsize);
-			OffsetNumber	*nextoffset;
+			DTS_BlockHeader *blkhdr;
+			OffsetNumber   *nextoffset;
+			BlockNumber		blkno;
 
 			if (runoffset[run] == -1)
 				continue;
 
 			nopendingdata = false;
+			blkhdr = DTS_GetRunBlkHdr(runstate, run, runsize);
+			blkno = BlockIdGetBlockNumber(&blkhdr->blkid);
 
 			/*
 			 * Make sure that before we start merging offsets from this run,
 			 * the run is pointing to the right block header.  If block no is
-			 * of the block header already higher than the input blkno that
+			 * of the block header already higher than the targetblk that
 			 * means this run might not have more data for this block so don't
 			 * process this run further.  If block header is for smaller block
 			 * than we are looking for one or it is uninitialized then move
 			 * until we reach to the right block header.
 			 */
-			while (blkhdr->blkno < blkno ||
-				   (blkhdr->blkno == 0 && blkhdr->noffsets == 0))
+			while (blkno < targetblk || (blkno == 0 && blkhdr->noffsets == 0))
 			{
 				/*
 				 * There is no more data into the current run so nothing to do
@@ -952,10 +958,11 @@ dts_merge_runs(DTS_DeadTidState *deadtidstate, BlockNumber blkno)
 
 				/* Fetch the current block header from the run. */
 				blkhdr = DTS_GetRunBlkHdr(runstate, run, runsize);
+				blkno = BlockIdGetBlockNumber(&blkhdr->blkid);
 			}
 
 			/* We have found a matching block header. */
-			if (blkhdr->blkno == blkno)
+			if (blkno == targetblk)
 			{
 				/* Block header can not be with 0 offsets. */
 				Assert(blkhdr->noffsets != 0);
