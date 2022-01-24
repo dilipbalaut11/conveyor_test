@@ -189,6 +189,9 @@ typedef struct VacAttrStats
 #define VACOPT_PROCESS_TOAST 0x40	/* process the TOAST table, if any */
 #define VACOPT_DISABLE_PAGE_SKIPPING 0x80	/* don't skip any pages */
 
+#define VACOPT_HEAP_HOT_PRUNE 0x100	/* first heap pass */
+#define VACOPT_HEAP_VACUUM 0x200	/* second heap pass */
+
 /*
  * Values used by index_cleanup and truncate params.
  *
