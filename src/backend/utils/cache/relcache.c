@@ -3781,6 +3781,7 @@ RelationSetNewRelfilenode(Relation relation, char persistence)
 			classform->relpages = 0;	/* it's empty until further notice */
 			classform->reltuples = -1;
 			classform->relallvisible = 0;
+			classform->relvacuumpage = -1;
 		}
 		classform->relfrozenxid = freezeXid;
 		classform->relminmxid = minmulti;
