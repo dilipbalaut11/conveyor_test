@@ -114,6 +114,8 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	bool		full = false;
 	bool		disable_page_skipping = false;
 	bool		process_toast = true;
+	bool		heap_hot_prune = false;
+	bool		heap_vacuum = false;
 	ListCell   *lc;
 
 	/* index_cleanup and truncate values unspecified for now */
@@ -200,6 +202,10 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 					params.nworkers = nworkers;
 			}
 		}
+		else if (strcmp(opt->defname, "heap_hot_prune") == 0)
+			heap_hot_prune = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "heap_vacuum") == 0)
+			heap_vacuum = defGetBoolean(opt);
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -216,7 +222,9 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 		(freeze ? VACOPT_FREEZE : 0) |
 		(full ? VACOPT_FULL : 0) |
 		(disable_page_skipping ? VACOPT_DISABLE_PAGE_SKIPPING : 0) |
-		(process_toast ? VACOPT_PROCESS_TOAST : 0);
+		(process_toast ? VACOPT_PROCESS_TOAST : 0) |
+		(heap_hot_prune ? VACOPT_HEAP_HOT_PRUNE : 0) |
+		(heap_vacuum ? VACOPT_HEAP_VACUUM : 0);
 
 	/* sanity checks on options */
 	Assert(params.options & (VACOPT_VACUUM | VACOPT_ANALYZE));
@@ -343,6 +351,22 @@ vacuum(List *relations, VacuumParams *params,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("VACUUM option DISABLE_PAGE_SKIPPING cannot be used with FULL")));
+
+	/*
+	 * Disable skipping is only used while scanning the relation during hot
+	 * pruning pass but if we are just doing the vacuum pass then this
+	 * parameter makes no sense.
+	 */
+	if ((params->options & VACOPT_HEAP_VACUUM) != 0 &&
+		(params->options & VACOPT_DISABLE_PAGE_SKIPPING) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("VACUUM option DISABLE_PAGE_SKIPPING cannot be used with HEAP_VACUUM")));
+
+	/*
+	 * TODO: Now we have some new options so check what all combinations needs
+	 * to throw error.
+	 */
 
 	/* sanity check for PROCESS_TOAST */
 	if ((params->options & VACOPT_FULL) != 0 &&
@@ -1895,6 +1919,28 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams *params)
 								  params->options & VACOPT_VACUUM))
 	{
 		relation_close(rel, lmode);
+		PopActiveSnapshot();
+		CommitTransactionCommand();
+		return false;
+	}
+
+	/*
+	 * If the relation type is index then perform the index vacuum and return
+	 * false because for the index vacuum we don't need to do ANALYZE.
+	 *
+	 * XXX maybe we could add a check and report error for the input
+	 * params->options which are not valid for the index vacuum.
+	 */
+	if (rel->rd_rel->relkind == RELKIND_INDEX)
+	{
+		Relation	heapRel;
+
+		heapRel = table_open(rel->rd_index->indrelid, lmode);
+
+		lazy_vacuum_index(heapRel, rel, vac_strategy);
+
+		relation_close(rel, lmode);
+		relation_close(heapRel, lmode);
 		PopActiveSnapshot();
 		CommitTransactionCommand();
 		return false;
