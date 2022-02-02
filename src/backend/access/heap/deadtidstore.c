@@ -484,7 +484,7 @@ DTS_DeadtidExists(DTS_DeadTidState *deadtidstate, BlockNumber blkno,
 		return false;
 
 	/* No data to be compared for this block then just return. */
-	if (deadtidstate->num_offsets == 0)
+	if (deadtidstate->num_offsets <= 0)
 		return false;
 
 	/* Search the offset in the cache. */
