@@ -291,8 +291,9 @@ typedef struct LVSavedErrInfo
 typedef struct LVDeadItemReadState
 {
 	bool		cacheread_done;
-	CBPageNo	cblastreadpage;
-	CBPageNo	cbnextrunpage;
+	CBPageNo	startpage;
+	CBPageNo	lastreadpage;
+	CBPageNo	nextrunpage;
 } LVDeadItemReadState;
 
 /* non-export function prototypes */
@@ -307,7 +308,8 @@ static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel, bool heap_vacuum_only);
 static int	lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
-								  Buffer buffer, int index, Buffer *vmbuffer);
+								  Buffer buffer, int index, Buffer *vmbuffer,
+								  OffsetNumber *offsets, int ucnt);
 static bool lazy_check_needs_freeze(Buffer buf, bool *hastup,
 									LVRelState *vacrel);
 static bool lazy_check_wraparound_failsafe(LVRelState *vacrel);
@@ -347,8 +349,8 @@ static void copy_deaditems_to_cache(LVDeadOffsetCache *dead_items,
 									BlockNumber blkno,
 									int noffsets,  OffsetNumber *offsets);
 static int vacuum_read_deaditems(LVDeadItemReadState *readstate,
-								 Relation indrel, LVRelState *vacrel,
-								 int maxitems, ItemPointerData *deaditems);
+								 LVRelState *vacrel, int maxitems,
+								 ItemPointerData *deaditems);
 static CBPageNo get_min_indexvac_page(LVRelState *vacrel);
 
 /*
@@ -1322,7 +1324,10 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 			{
 				Size		freespace;
 
-				lazy_vacuum_heap_page(vacrel, blkno, buf, 0, &vmbuffer);
+				lazy_vacuum_heap_page(vacrel, blkno, buf, 0, &vmbuffer,
+									  (OffsetNumber *) (dead_itemcache->data +
+									  sizeof(DTS_BlockHeader)),
+									  dead_itemcache->num_items);
 
 				/* Forget the LP_DEAD items that we just vacuumed */
 				dead_itemcache->num_items = 0;
@@ -1364,7 +1369,7 @@ lazy_scan_heap(LVRelState *vacrel, VacuumParams *params, bool aggressive)
 			 * with prunestate-driven visibility map and FSM steps (just like
 			 * the two-pass strategy).
 			 */
-			Assert(vacrel->dead_itemcache->num_items = 0);
+			Assert(vacrel->dead_itemcache->num_items == 0);
 		}
 
 		/*
@@ -2151,28 +2156,54 @@ lazy_vacuum(LVRelState *vacrel)
 		 */
 		vacrel->do_index_vacuuming = false;
 	}
-	else if (lazy_vacuum_all_indexes(vacrel))
-	{
-		/*
-		 * We successfully completed a round of index vacuuming.  Do related
-		 * heap vacuuming now.
-		 */
-		lazy_vacuum_heap_rel(vacrel, false);
-	}
 	else
 	{
+		VacDeadItems	*dead_items;
+		LVDeadItemReadState readstate = {0};
+
+		readstate.cacheread_done = false;
+		readstate.startpage = get_min_indexvac_page(vacrel);
+		readstate.lastreadpage = CB_INVALID_LOGICAL_PAGE;
+		readstate.nextrunpage = CB_INVALID_LOGICAL_PAGE;
+
+		dead_items_alloc(vacrel, -1);
+		dead_items = vacrel->dead_items;
+
 		/*
-		 * Failsafe case.
-		 *
-		 * We attempted index vacuuming, but didn't finish a full round/full
-		 * index scan.  This happens when relfrozenxid or relminmxid is too
-		 * far in the past.
-		 *
-		 * From this point on the VACUUM operation will do no further index
-		 * vacuuming or heap vacuuming.  This VACUUM operation won't end up
-		 * back here again.
-		 */
-		Assert(vacrel->failsafe_active);
+		* Loop until we complete the index vacuum.  Read tuples which can fit into
+		* the dead_items area and perform the index vacuum.  Repeat this until
+		* there is no TID in the dead tuple store.
+		*/
+		while(1)
+		{
+			/* Read dead tids from the dead tuple store. */
+			dead_items->num_items = vacuum_read_deaditems(&readstate, vacrel,
+														  dead_items->max_items,
+														  dead_items->items);
+
+			/* No more dead tuples so we are done. */
+			if (dead_items->num_items == 0)
+				break;
+
+			if (lazy_vacuum_all_indexes(vacrel))
+				lazy_vacuum_heap_rel(vacrel, false);
+			else
+			{
+				/*
+				 * Failsafe case.
+				 *
+				 * We attempted index vacuuming, but didn't finish a full round/full
+				 * index scan.  This happens when relfrozenxid or relminmxid is too
+				 * far in the past.
+				 *
+				 * From this point on the VACUUM operation will do no further index
+				 * vacuuming or heap vacuuming.  This VACUUM operation won't end up
+				 * back here again.
+				 */
+				Assert(vacrel->failsafe_active);
+			}
+			 
+		}
 	}
 
 	/*
@@ -2253,7 +2284,7 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 	 * place).
 	 */
 	Assert(vacrel->num_index_scans > 0 ||
-		   vacrel->dead_itemcache->num_items == vacrel->lpdead_items);
+		   vacrel->dead_items->num_items == vacrel->lpdead_items);
 	Assert(allindexes || vacrel->failsafe_active);
 
 	/*
@@ -2330,7 +2361,8 @@ lazy_vacuum_heap_rel(LVRelState *vacrel, bool heap_vacuum_only)
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, tblk, RBM_NORMAL,
 								 vacrel->bstrategy);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		index = lazy_vacuum_heap_page(vacrel, tblk, buf, index, &vmbuffer);
+		index = lazy_vacuum_heap_page(vacrel, tblk, buf, index, &vmbuffer,
+									  NULL, 0);
 
 		/* Now that we've vacuumed the page, record its available space */
 		page = BufferGetPage(buf);
@@ -2387,16 +2419,16 @@ lazy_vacuum_heap_rel(LVRelState *vacrel, bool heap_vacuum_only)
  */
 static int
 lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
-					  int index, Buffer *vmbuffer)
+					  int index, Buffer *vmbuffer, OffsetNumber *offsets,
+					  int uncnt)
 {
-	LVDeadOffsetCache   *dead_items = vacrel->dead_itemcache;
-	OffsetNumber		*offset;
 	Page		page = BufferGetPage(buffer);
 	OffsetNumber unused[MaxHeapTuplesPerPage];
-	int			uncnt = 0;
 	TransactionId visibility_cutoff_xid;
 	bool		all_frozen;
-	LVSavedErrInfo saved_err_info;
+	int			num_items;
+	LVSavedErrInfo	saved_err_info;
+	VacDeadItems   *dead_items = NULL;
 
 	Assert(vacrel->nindexes == 0 || vacrel->do_index_vacuuming);
 
@@ -2407,19 +2439,39 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 							 VACUUM_ERRCB_PHASE_VACUUM_HEAP, blkno,
 							 InvalidOffsetNumber);
 
-	offset = (OffsetNumber *) (dead_items->data + sizeof(DTS_BlockHeader));
+	if (uncnt == 0)
+	{
+		dead_items = vacrel->dead_items;
+		num_items = dead_items->num_items;
+		offsets = unused;
+	}
+	else
+		num_items = uncnt;
 
 	START_CRIT_SECTION();
 
-	for (; index < dead_items->num_items; index++)
+	for (; index < num_items; index++)
 	{
+		BlockNumber tblk;
+		OffsetNumber toff;
 		ItemId		itemid;
 
-		itemid = PageGetItemId(page, offset[index]);
+		if (dead_items)
+		{
+			tblk = ItemPointerGetBlockNumber(&dead_items->items[index]);
+			if (tblk != blkno)
+				break;				/* past end of tuples for this block */
+
+			toff = ItemPointerGetOffsetNumber(&dead_items->items[index]);
+			offsets[uncnt++] = toff;
+		}
+		else
+			toff = offsets[index];
+		
+		itemid = PageGetItemId(page, toff);
 
 		Assert(ItemIdIsDead(itemid) && !ItemIdHasStorage(itemid));
 		ItemIdSetUnused(itemid);
-		unused[uncnt++] = offset[index];
 	}
 
 	Assert(uncnt > 0);
@@ -2444,7 +2496,7 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 		XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
-		XLogRegisterBufData(0, (char *) unused, uncnt * sizeof(OffsetNumber));
+		XLogRegisterBufData(0, (char *) offsets, uncnt * sizeof(OffsetNumber));
 
 		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);
 
@@ -2663,13 +2715,6 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 {
 	IndexVacuumInfo ivinfo;
 	LVSavedErrInfo saved_err_info;
-	VacDeadItems   *dead_items;
-	LVDeadItemReadState readstate = {0};
-
-	readstate.cacheread_done = false;
-	readstate.cblastreadpage = CB_INVALID_LOGICAL_PAGE;
-	readstate.cbnextrunpage = CB_INVALID_LOGICAL_PAGE;
-
 
 	ivinfo.index = indrel;
 	ivinfo.analyze_only = false;
@@ -2691,44 +2736,13 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 							 VACUUM_ERRCB_PHASE_VACUUM_INDEX,
 							 InvalidBlockNumber, InvalidOffsetNumber);
 
-	dead_items_alloc(vacrel, -1);
-	dead_items = vacrel->dead_items;
-
-	/*
-	 * Loop until we complete the index vacuum.  Read tuples which can fit into
-	 * the dead_items area and perform the index vacuum.  Repeat this until
-	 * there is no TID in the dead tuple store.
-	 */
-	while(1)
-	{
-		/* Read dead tids from the dead tuple store. */
-		dead_items->num_items = vacuum_read_deaditems(&readstate, indrel,
-													  vacrel,
-													  dead_items->max_items,
-													  dead_items->items);
-
-		/* No more dead tuples so we are done. */
-		if (dead_items->num_items == 0)
-			break;
-
-		/* Do bulk deletion */
-		istat = vac_bulkdel_one_index(&ivinfo, istat, (void *) dead_items);
-	}
+	/* Do bulk deletion */
+	istat = vac_bulkdel_one_index(&ivinfo, istat, (void *) vacrel->dead_items);
 
 	/* Revert to the previous phase information for error traceback */
 	restore_vacuum_error_info(vacrel, &saved_err_info);
 	pfree(vacrel->indname);
 	vacrel->indname = NULL;
-
-	/*
-	 * Remember the conveyor belt pageno into the pg_class entry for the index
-	 * so that next time we can start vacuum from this point.
-	 */
-	if (readstate.cblastreadpage != CB_INVALID_LOGICAL_PAGE)
-		UpdateRelationLastVaccumPage(RelationGetRelid(indrel),
-									 readstate.cblastreadpage + 1);
-
-	dead_items_cleanup(vacrel);
 
 	return istat;
 }
@@ -2852,12 +2866,12 @@ cache_read_deaditems(LVRelState *vacrel, ItemPointerData *items)
  * read them from the underlying dead tid store over the conveyor belt.
  */
 static int
-vacuum_read_deaditems(LVDeadItemReadState *readstate, Relation indrel,
+vacuum_read_deaditems(LVDeadItemReadState *readstate,
 					  LVRelState *vacrel, int maxitems,
 					  ItemPointerData *deaditems)
 {
 	CBPageNo	start_pageno = CB_INVALID_LOGICAL_PAGE;
-	int			num_items;
+	int			num_items = 0;
 
 	/*
 	 * If there is any data in the cache then first read them from the cache
@@ -2876,7 +2890,8 @@ vacuum_read_deaditems(LVDeadItemReadState *readstate, Relation indrel,
 	 * If there are still some space left in the cache then we can read more
 	 * data from the conveyor belt.
 	 */
-	if (num_items == maxitems /* || !has_conveyor_belt_tuple()*/)
+	if (num_items == maxitems ||
+		readstate->startpage == CB_INVALID_LOGICAL_PAGE)
 		return num_items;
 
 	/*
@@ -2884,20 +2899,14 @@ vacuum_read_deaditems(LVDeadItemReadState *readstate, Relation indrel,
 	 * in the previous call otherwise get the start page from the pg_class
 	 * tuple.
 	 */
-	if (readstate->cblastreadpage != CB_INVALID_LOGICAL_PAGE)
-		start_pageno = readstate->cblastreadpage + 1;
-	else
-	{
-		start_pageno = indrel->rd_rel->relvacuumpage;
-		if (start_pageno == CB_INVALID_LOGICAL_PAGE)
-			start_pageno = 0;
-	}
+	start_pageno = readstate->startpage;
 
 	num_items += DTS_ReadDeadtids(vacrel->deadtidstate, start_pageno,
 								  CB_INVALID_LOGICAL_PAGE,
 								  maxitems - num_items, deaditems + num_items,
-								  &readstate->cblastreadpage,
-								  &readstate->cbnextrunpage);
+								  &readstate->lastreadpage,
+								  &readstate->nextrunpage);
+	readstate->startpage = readstate->lastreadpage + 1;
 
 	return num_items;
 }
