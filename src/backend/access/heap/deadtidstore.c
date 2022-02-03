@@ -395,6 +395,53 @@ DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate, CBPageNo from_pageno,
 }
 
 /*
+ * DTS_ReadDeadtids - Read dead tids from the conveyor belt
+ *
+ * 'from_pageno' is the conveyor belt page number from where we want to start
+ * and the 'to_pageno' upto which we want to read.
+ * 'deadtids' is pre allocated array for holding the dead tids, the allocated
+ * size is sufficient to hold 'maxtids'.
+ *
+ * On successful read last page number we have read from conveyor belt will be
+ * stored into the '*last_pageread' and the first page of the next run will
+ * be stored into the '*next_runpage'
+ *
+ * Returns number of dead tids actually read from the conveyor belt.  Should
+ * always be <= maxtids.
+ */
+int
+DTS_ReadPageData(DTS_DeadTidState *deadtidstate, CBPageNo pageno,
+				 char *buf)
+{
+	ConveyorBelt   *cb = deadtidstate->cb;
+	Page			page;
+	PageHeader		phdr;
+	Buffer			buffer;
+	int				bufsz = 0;
+	char		   *pagedata;
+
+	/* Read page from the conveyor belt. */
+	buffer = ConveyorBeltReadBuffer(cb, pageno, BUFFER_LOCK_SHARE, NULL);
+	if (BufferIsInvalid(buffer))
+		return bufsz;
+
+	page = BufferGetPage(buffer);
+	phdr = (PageHeader) page;
+
+	/*
+	 * There might be some empty space at the end of the page so while
+	 * copying skip that size, that size will be equal to difference
+	 * between pd_upper and pd_lower.
+	 */
+	bufsz = DTS_PageMaxDataSpace - (phdr->pd_upper - phdr->pd_lower);
+	memcpy(buf, PageGetContents(page), bufsz);
+
+	UnlockReleaseBuffer(buffer);
+
+	return bufsz;
+}
+
+/*
  * DTS_LoadDeadtids - Load dead offset from conveyor belt for given block.
  *
  * 'blkno' is current heap block we are going to scan, so this function need to

@@ -2204,6 +2204,25 @@ lazy_vacuum(LVRelState *vacrel)
 			}
 			 
 		}
+
+		/*
+	 	 * Remember the conveyor belt pageno into the pg_class entry for all
+		 * the indexes and the table so that next time we can start vacuum
+		 * from this point.
+	 	 */
+		if (readstate.startpage != CB_INVALID_LOGICAL_PAGE)
+		{
+			for (int idx = 0; idx < vacrel->nindexes; idx++)
+			{
+				Relation	indrel = vacrel->indrels[idx];
+				
+				UpdateRelationLastVaccumPage(RelationGetRelid(indrel),
+												readstate.startpage);
+			}
+
+			UpdateRelationLastVaccumPage(RelationGetRelid(vacrel->rel),
+										 readstate.startpage);
+		}
 	}
 
 	/*
@@ -2300,6 +2319,40 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 	return allindexes;
 }
 
+static BlockNumber
+lazy_vacuum_nextblock_data(char *data, int size, OffsetNumber **offsets,
+					  	   int *readloc, int *noffsets)
+{
+	int nbyteread = *readloc;
+	DTS_BlockHeader	   *blkhdr;
+	OffsetNumber	   *offsets;
+
+	if (*readloc >= size)
+		return InvalidBlockNumber;
+	
+	/*
+	 * Read next block header, if the block header is not initialized
+	 * i.e. noffsets is 0 then we are done with this page.
+	 */
+	blkhdr = (DTS_BlockHeader *) (data + nbyteread);
+
+	/*
+	 * Skip the block header so that we reach to the offset array for this
+	 * block number.
+	 */
+	nbyteread += sizeof(DTS_BlockHeader);
+	*offsets = (OffsetNumber *) (data + nbyteread);
+
+	/*
+	 * Skip all the offset w.r.t. the current block so that we point to the
+	 * next block header in the page.
+	 */
+	nbyteread += (blkhdr->noffsets * sizeof(OffsetNumber));
+	*noffsets = blkhdr->noffsets;
+
+	return BlockIdGetBlockNumber(&blkhdr->blkid);
+}
+
 /*
  *	lazy_vacuum_heap_rel() -- second pass over the heap for two pass strategy
  *
@@ -2319,7 +2372,8 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
  * index entry removal in batches as large as possible.
  */
 static void
-lazy_vacuum_heap_rel(LVRelState *vacrel, bool heap_vacuum_only)
+lazy_vacuum_heap_rel(LVRelState *vacrel, char *data, int size,
+					 bool heap_vacuum_only)
 {
 	int			index;
 	BlockNumber vacuumed_pages;
@@ -2347,22 +2401,36 @@ lazy_vacuum_heap_rel(LVRelState *vacrel, bool heap_vacuum_only)
 	vacuumed_pages = 0;
 
 	index = 0;
-	while (index < vacrel->dead_items->num_items)
+	while (1)
 	{
-		BlockNumber tblk;
+		BlockNumber 	tblk;
+		OffsetNumber   *offsets;
 		Buffer		buf;
 		Page		page;
 		Size		freespace;
+		int			readloc;
+		int			noffsets = 0;
 
 		vacuum_delay_point();
 
-		tblk = ItemPointerGetBlockNumber(&vacrel->dead_items->items[index]);
+		if (heap_vacuum_only)
+		{
+			tblk = lazy_vacuum_nextblock_data(data, size, &offsets, &readloc,
+									   		  &noffsets);
+			if (!BlockNumberIsValid(tblk))
+				break;
+
+			index = 0;
+		}
+		else if (index < vacrel->dead_items->num_items)
+			tblk = ItemPointerGetBlockNumber(&vacrel->dead_items->items[index]);
+
 		vacrel->blkno = tblk;
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, tblk, RBM_NORMAL,
 								 vacrel->bstrategy);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 		index = lazy_vacuum_heap_page(vacrel, tblk, buf, index, &vmbuffer,
-									  NULL, 0);
+									  *offsets, noffsets);
 
 		/* Now that we've vacuumed the page, record its available space */
 		page = BufferGetPage(buf);
@@ -2386,7 +2454,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel, bool heap_vacuum_only)
 	 * We set all LP_DEAD items from the first heap pass to LP_UNUSED during
 	 * the second heap pass.  No more, no less.
 	 */
-	Assert(index > 0);
+	Assert(heap_vacuum_only || index > 0);
 	Assert(heap_vacuum_only || vacrel->num_index_scans > 1 ||
 		   (index == vacrel->lpdead_items &&
 			vacuumed_pages == vacrel->lpdead_item_pages));
@@ -2922,8 +2990,10 @@ void
 lazy_vacuum_index(Relation heaprel, Relation indrel,
 				  BufferAccessStrategy strategy)
 {
+	VacDeadItems   *dead_items;
 	LVRelState		vacrel = {0};
 	DTS_DeadTidState	   *dts;
+	LVDeadItemReadState		readstate = {0};
 	IndexBulkDeleteResult  *istat = NULL;
 	ErrorContextCallback errcallback;
 
@@ -2951,6 +3021,9 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	dead_items_alloc(&vacrel, -1);
+	dead_items = vacrel.dead_items;
+
 	/* Report that we are now vacuuming indexes */
 	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
 								 PROGRESS_VACUUM_PHASE_VACUUM_INDEX);
@@ -2960,9 +3033,40 @@ lazy_vacuum_index(Relation heaprel, Relation indrel,
 	vacrel.deadtidstate = dts;
 	vacrel.dead_itemcache = NULL;
 
-	/* Do index vacuuming. */
-	istat = lazy_vacuum_one_index(indrel, istat,
+	readstate.cacheread_done = false;
+	readstate.startpage = indrel->rd_rel->relvacuumpage;
+	readstate.lastreadpage = CB_INVALID_LOGICAL_PAGE;
+	readstate.nextrunpage = CB_INVALID_LOGICAL_PAGE;
+
+
+	/*
+	 * Loop until we complete the index vacuum.  Read tuples which can fit into
+	 * the dead_items area and perform the index vacuum.  Repeat this until
+	 * there is no TID in the dead tuple store.
+	 */
+	while(1)
+	{
+		/* Read dead tids from the dead tuple store. */
+		dead_items->num_items = vacuum_read_deaditems(&readstate, &vacrel,
+													  dead_items->max_items,
+													  dead_items->items);
+
+		/* No more dead tuples so we are done. */
+		if (dead_items->num_items == 0)
+			break;
+
+		/* Do index vacuuming. */
+		istat = lazy_vacuum_one_index(indrel, istat,
 								  heaprel->rd_rel->reltuples, &vacrel);
+	}
+
+	/*
+	 * Remember the conveyor belt pageno into the pg_class entry so that next
+	 * time we can start vacuum from this point.
+	 */
+	if (readstate.startpage != CB_INVALID_LOGICAL_PAGE)
+		UpdateRelationLastVaccumPage(RelationGetRelid(indrel),
+									 readstate.startpage);
 
 	/* Update vacuum progress. */
 	pgstat_progress_update_param(PROGRESS_VACUUM_NUM_INDEX_VACUUMS,
@@ -2999,7 +3103,7 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	CBPageNo	to_pageno = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	next_runpage = CB_INVALID_LOGICAL_PAGE;
 	CBPageNo	last_pageread;
-	VacDeadItems	   *dead_items;
+	char		data[BLCKSZ];
 	DTS_DeadTidState   *dts;
 
 	/*
@@ -3011,15 +3115,6 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	 */
 	lazy_init_vacrel(vacrel, InvalidBlockNumber);
 
-	/*
-	 * XXX Currently, we have to allocate the dead item array and while
-	 * reading from the conveyor belt we need to convert it to dead item array
-	 * because lazy_vacuum_heap_rel expect dead item array.  But once we unify
-	 * the in memory format for dead items then we can avoid this conversion
-	 * and directly perform heap vacuum page by page.
-	 */
-	dead_items_alloc(vacrel, -1);
-	dead_items = vacrel->dead_items;
 	vacrel->rel_pages = RelationGetNumberOfBlocks(vacrel->rel);
 
 	/*
@@ -3050,19 +3145,15 @@ lazy_vacuum_heap(LVRelState *vacrel, VacuumParams *params)
 	/* Loop until we complete the heap vacuum. */
 	while(from_pageno < to_pageno)
 	{
-		/* Read dead tids from the conveyor belt. */
-		dead_items->num_items = DTS_ReadDeadtids(dts, from_pageno,
-												 to_pageno,
-												 dead_items->max_items,
-												 dead_items->items,
-												 &last_pageread,
-												 &next_runpage);
+		OffsetNumber   *offsets;
+		int				size;
+		int				nbyteread = 0;
 
-		/* No more dead tids, we are done. */
-		if (dead_items->num_items == 0)
+		/* Read dead tids from the conveyor belt. */
+		size = DTS_ReadPageData(dts, from_pageno, data);
+		if (size == 0)
 			break;
 
-		/* Perform heap vacuum. */
 		lazy_vacuum_heap_rel(vacrel, true);
 
 		/* Go to the next logical page. */

@@ -65,6 +65,8 @@ extern int DTS_ReadDeadtids(DTS_DeadTidState *deadtidstate,
 							CBPageNo from_pageno, CBPageNo to_pageno,
 							int maxtids, ItemPointerData *deadtids,
 							CBPageNo *last_pageread, CBPageNo *next_runpage);
+extern int DTS_ReadPageData(DTS_DeadTidState *deadtidstate, CBPageNo pageno,
+				 			char *buf);
 extern void DTS_LoadDeadtids(DTS_DeadTidState *deadtidstate,
 							 BlockNumber blkno);
 extern bool DTS_DeadtidExists(DTS_DeadTidState *deadtidstate,
