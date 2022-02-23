@@ -41,11 +41,13 @@
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/transam.h"
+#include "access/vacuumdeaditem.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/index.h"
+#include "catalog/indexing.h"
 #include "catalog/storage.h"
 #include "commands/dbcommands.h"
 #include "commands/progress.h"
@@ -63,6 +65,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/pg_rusage.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 
 
@@ -217,6 +220,13 @@ typedef struct LVRelState
 	int64		missed_dead_tuples; /* # removable, but not removed */
 	int64		num_tuples;		/* total number of nonremovable tuples */
 	int64		live_tuples;	/* live tuples (reltuples estimate) */
+
+	/* Vacuum dead item state */
+	bool		use_conveyorbelt;
+	bool	   *skipidxvacuum;
+	bool		isheapvacuumdone;
+	CBPageNo	vacrelpage;
+	VDI_DeadItemState *deaditemstate;
 } LVRelState;
 
 /*
@@ -261,6 +271,7 @@ static bool lazy_scan_noprune(LVRelState *vacrel, Buffer buf,
 static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
+static void lazy_vacuum_heap(LVRelState *vacrel);
 static int	lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
 								  Buffer buffer, int index, Buffer *vmbuffer);
 static bool lazy_check_wraparound_failsafe(LVRelState *vacrel);
@@ -282,6 +293,7 @@ static void dead_items_alloc(LVRelState *vacrel, int nworkers);
 static void dead_items_cleanup(LVRelState *vacrel);
 static bool heap_page_is_all_visible(LVRelState *vacrel, Buffer buf,
 									 TransactionId *visibility_cutoff_xid, bool *all_frozen);
+static void update_relvacuum_page(Oid relid, CBPageNo pageno);
 static void update_index_statistics(LVRelState *vacrel);
 static void vacuum_error_callback(void *arg);
 static void update_vacuum_error_info(LVRelState *vacrel,
@@ -795,6 +807,7 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 				next_fsm_block_to_vacuum;
 	Buffer		vmbuffer = InvalidBuffer;
 	bool		skipping_blocks;
+	bool		skip_indexvacuum = false;
 	const int	initprog_index[] = {
 		PROGRESS_VACUUM_PHASE,
 		PROGRESS_VACUUM_TOTAL_HEAP_BLKS,
@@ -825,6 +838,7 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 
 	vacrel->indstats = (IndexBulkDeleteResult **)
 		palloc0(vacrel->nindexes * sizeof(IndexBulkDeleteResult *));
+	vacrel->skipidxvacuum = palloc(vacrel->nindexes * sizeof(bool));
 
 	/*
 	 * Do failsafe precheck before calling dead_items_alloc.  This ensures
@@ -842,6 +856,12 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 	dead_items_alloc(vacrel, nworkers);
 	dead_items = vacrel->dead_items;
 	next_fsm_block_to_vacuum = 0;
+
+	/*
+	 * Initialize dead item state.  For more detail refer to the comments atop
+	 * VDI_DeadItemState in vacuumdeaditem.c.
+	 */
+	vacrel->deaditemstate = VDI_InitDeadItemState(vacrel->rel);
 
 	/* Report that we're scanning the heap, advertising total # of blocks */
 	initprog_val[0] = PROGRESS_VACUUM_PHASE_SCAN_HEAP;
@@ -1040,17 +1060,17 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 		/*
 		 * Consider if we definitely have enough space to process TIDs on page
 		 * already.  If we are close to overrunning the available space for
-		 * dead_items TIDs, pause and do a cycle of vacuuming before we tackle
-		 * this page.
+		 * dead_items TIDs, pause and flush the existing dead items into the
+		 * conveyor belt storage before we tackle this page.
 		 */
 		Assert(dead_items->max_items >= MaxHeapTuplesPerPage);
 		if (dead_items->max_items - dead_items->num_items < MaxHeapTuplesPerPage)
 		{
 			/*
-			 * Before beginning index vacuuming, we release any pin we may
-			 * hold on the visibility map page.  This isn't necessary for
-			 * correctness, but we do it anyway to avoid holding the pin
-			 * across a lengthy, unrelated operation.
+			 * Before start flushing the items to the conveyor belt, we release
+			 * any pin we may hold on the visibility map page.  This isn't
+			 * necessary for correctness, but we do it anyway to avoid holding
+			 * the pin across a lengthy, unrelated operation.
 			 */
 			if (BufferIsValid(vmbuffer))
 			{
@@ -1058,17 +1078,13 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 				vmbuffer = InvalidBuffer;
 			}
 
-			/* Perform a round of index and heap vacuuming */
-			vacrel->consider_bypass_optimization = false;
-			lazy_vacuum(vacrel);
-
-			/*
-			 * Vacuum the Free Space Map to make newly-freed space visible on
-			 * upper-level FSM pages.  Note we have not yet processed blkno.
-			 */
-			FreeSpaceMapVacuumRange(vacrel->rel, next_fsm_block_to_vacuum,
-									blkno);
-			next_fsm_block_to_vacuum = blkno;
+			/* Flush existing dead items to the conveyor belt. */
+			pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
+										 PROGRESS_VACUUM_PHASE_SAVE_DEADITEMS);
+			VDI_InsertDeadItems(vacrel->deaditemstate,
+								vacrel->dead_items->num_items,
+								vacrel->dead_items->items);
+			vacrel->dead_items->num_items = 0;
 
 			/* Report that we are once again scanning the heap */
 			pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
@@ -1163,6 +1179,14 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 		if (prunestate.hastup)
 			vacrel->nonempty_pages = blkno + 1;
 
+		/*
+		 * It is possible that in last vacuum pass we had index on the table
+		 * so we might have some old unprocessed dead items in the conveyor
+		 * belt.  But there is no problem in performing the heap vacuuming for
+		 * the new items we are collecting now.  And later at the end of the
+		 * loop we will be calling the heap vacuum and unde that we will
+		 * perform the second heap pass for the items in the conveyor belt.
+		 */
 		if (vacrel->nindexes == 0)
 		{
 			/*
@@ -1375,9 +1399,69 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 		vmbuffer = InvalidBuffer;
 	}
 
-	/* Perform a final round of index and heap vacuuming */
-	if (dead_items->num_items > 0)
+	/*
+	 * Loop through all the indexes and mark the flag whether index vacuum can
+	 * be skip for any of the index and set the skip flag for each index.
+	 */
+	for (int idx = 0; idx < vacrel->nindexes; idx++)
+	{
+		Relation	indrel = vacrel->indrels[idx];
+
+		/*
+		 * TODO: For now index vacuum skipping is not implemented for the
+		 * parallel vacuum.
+		 */
+		if (!ParallelVacuumIsActive(vacrel) && index_skip_bulk_delete(indrel))
+		{
+			vacrel->skipidxvacuum[idx] = true;
+			skip_indexvacuum = true;
+		}
+		else
+			vacrel->skipidxvacuum[idx] = false;
+	}
+
+	/*
+	 * If we are skipping the vacuum for any of the index or we already have
+	 * dead items in the conveyor belt, either from the previous vacuum pass
+	 * or from the current vacuum pass then we will be using conveyor belt for
+	 * the index vacuuming so set the flag.
+	 */
+	if (skip_indexvacuum || VDI_HasDeadItems(vacrel->deaditemstate))
+		vacrel->use_conveyorbelt = true;
+
+	/*
+	 * If we have some dead items in the cache or in the conveyor belt then
+	 * attempt the final round of the index and heap vacuuming.
+	 */
+	if (dead_items->num_items > 0 || VDI_HasDeadItems(vacrel->deaditemstate))
+	{
+		/*
+		 * If we are using the conveyor belt then flush the current tuple also
+		 * into the conveyor belt and then index and heap vacuuming will pull
+		 * the data directly from the conveyor belt.  Optionally, instead of
+		 * flushing the remaining item to the conveyor belt, we can first
+		 * perform the vacuum for these new items and then we can pull data
+		 * from the conveyor belt.  But it is better to first do the vacuum for
+		 * the items which got deleted earlier.
+		 */
+		if (vacrel->use_conveyorbelt)
+		{
+			pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
+										 PROGRESS_VACUUM_PHASE_SAVE_DEADITEMS);
+			VDI_InsertDeadItems(vacrel->deaditemstate,
+								vacrel->dead_items->num_items,
+								vacrel->dead_items->items);
+			vacrel->dead_items->num_items = 0;
+			vacrel->vacrelpage = VDI_GetLastPage(vacrel->deaditemstate);
+			vacrel->isheapvacuumdone = false;
+		}
+
+		/* Do index and heap vacuuming. */
 		lazy_vacuum(vacrel);
+
+		/* Save the vacuum run. */
+		VDI_SaveVacuumRun(vacrel->deaditemstate);
+	}
 
 	/*
 	 * Vacuum the remainder of the Free Space Map.  We must do this whether or
@@ -1403,6 +1487,35 @@ lazy_scan_heap(LVRelState *vacrel, int nworkers)
 	/* Update index statistics */
 	if (vacrel->nindexes > 0 && vacrel->do_index_cleanup)
 		update_index_statistics(vacrel);
+
+	/*
+	 * If we are using the conveyor belt then set the conveyor belt pageno upto
+	 * which we have already vacuumed the indexes and the heap so that next
+	 * time we can start vacuum from this point and also vacuum the conveyor
+	 * belt.
+	 */
+	if (vacrel->use_conveyorbelt)
+	{
+		CBPageNo	lastpage = VDI_GetLastPage(vacrel->deaditemstate);
+
+		for (int idx = 0; idx < vacrel->nindexes; idx++)
+		{
+			Relation	indrel = vacrel->indrels[idx];
+
+			if (!vacrel->skipidxvacuum[idx])
+				update_relvacuum_page(RelationGetRelid(indrel), lastpage);
+		}
+
+		if (vacrel->isheapvacuumdone)
+		{
+			update_relvacuum_page(RelationGetRelid(vacrel->rel),
+								  vacrel->vacrelpage);
+			VDI_Vacuum(vacrel->deaditemstate, vacrel->vacrelpage + 1);
+		}
+	}
+
+	/* Release the dead item state. */
+	VDI_ReleaseDeadItemState(vacrel->deaditemstate);
 }
 
 /*
@@ -1912,12 +2025,31 @@ retry:
 
 		vacrel->lpdead_item_pages++;
 
+		/*
+		 * It is possible that the dead items we are finding now were already
+		 * stored on the conveyor belt in the previous passes, and those are
+		 * still there because the index vacuum and the heap second pass have
+		 * not yet been done.  If so, then collecting those items again makes
+		 * no sense because whenever we perform the index vacuum and the heap
+		 * second pass, we will count the dead items we are collecting now as
+		 * well as the ones on the conveyor belt. So in order to find
+		 * duplicates, load the conveyor belt items into the cache.
+		 */
+		VDI_LoadDeadItems(vacrel->deaditemstate, blkno,
+						  vacrel->dead_items->max_items);
+
 		ItemPointerSetBlockNumber(&tmp, blkno);
 
 		for (int i = 0; i < lpdead_items; i++)
 		{
 			ItemPointerSetOffsetNumber(&tmp, deadoffsets[i]);
-			dead_items->items[dead_items->num_items++] = tmp;
+
+			/*
+			 * Add it to the dead item array if it is not already exists in the
+			 * conveyor belt.
+			 */
+			if (!VDI_DeadItemExists(vacrel->deaditemstate, &tmp))
+				dead_items->items[dead_items->num_items++] = tmp;
 		}
 
 		Assert(dead_items->num_items <= dead_items->max_items);
@@ -2174,6 +2306,7 @@ static void
 lazy_vacuum(LVRelState *vacrel)
 {
 	bool		bypass;
+	bool		allindexes = false;
 
 	/* Should not end up here with no indexes */
 	Assert(vacrel->nindexes > 0);
@@ -2211,7 +2344,8 @@ lazy_vacuum(LVRelState *vacrel)
 		BlockNumber threshold;
 
 		Assert(vacrel->num_index_scans == 0);
-		Assert(vacrel->lpdead_items == vacrel->dead_items->num_items);
+		Assert(vacrel->use_conveyorbelt ||
+			   vacrel->lpdead_items == vacrel->dead_items->num_items);
 		Assert(vacrel->do_index_vacuuming);
 		Assert(vacrel->do_index_cleanup);
 
@@ -2258,11 +2392,7 @@ lazy_vacuum(LVRelState *vacrel)
 	}
 	else if (lazy_vacuum_all_indexes(vacrel))
 	{
-		/*
-		 * We successfully completed a round of index vacuuming.  Do related
-		 * heap vacuuming now.
-		 */
-		lazy_vacuum_heap_rel(vacrel);
+		allindexes = true;
 	}
 	else
 	{
@@ -2279,6 +2409,13 @@ lazy_vacuum(LVRelState *vacrel)
 		 */
 		Assert(vacrel->failsafe_active);
 	}
+
+	/*
+	 * If we successfully completed a round of index vacuuming, or if we are
+	 * using the conveyor belt the do related heap vacuuming.
+	 */
+	if (allindexes || vacrel->use_conveyorbelt)
+		lazy_vacuum_heap(vacrel);
 
 	/*
 	 * Forget the LP_DEAD items that we just vacuumed (or just decided to not
@@ -2324,6 +2461,17 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 			Relation	indrel = vacrel->indrels[idx];
 			IndexBulkDeleteResult *istat = vacrel->indstats[idx];
 
+			/*
+			 * If we don't need to vacuum this index then skip it.  But we
+			 * don't need to set the allindexes to false, because we are using
+			 * conveyor belt to remember the dead items across multiple passes.
+			 * So it is possible that in this pass we have skip some of the
+			 * index but there might be some items from the previous passes
+			 * for which performing heap vacuuming is safe.
+			 */
+			if (vacrel->skipidxvacuum[idx])
+				continue;
+
 			vacrel->indstats[idx] =
 				lazy_vacuum_one_index(indrel, istat, vacrel->old_live_tuples,
 									  vacrel);
@@ -2340,7 +2488,8 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 	{
 		/* Outsource everything to parallel variant */
 		parallel_vacuum_bulkdel_all_indexes(vacrel->pvs, vacrel->old_live_tuples,
-											vacrel->num_index_scans);
+											vacrel->num_index_scans,
+											vacrel->use_conveyorbelt);
 
 		/*
 		 * Do a postcheck to consider applying wraparound failsafe now.  Note
@@ -2357,7 +2506,7 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 	 * of the failsafe triggering, which prevents the next call from taking
 	 * place).
 	 */
-	Assert(vacrel->num_index_scans > 0 ||
+	Assert(vacrel->use_conveyorbelt || vacrel->num_index_scans > 0 ||
 		   vacrel->dead_items->num_items == vacrel->lpdead_items);
 	Assert(allindexes || vacrel->failsafe_active);
 
@@ -2400,9 +2549,9 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 	Buffer		vmbuffer = InvalidBuffer;
 	LVSavedErrInfo saved_err_info;
 
-	Assert(vacrel->do_index_vacuuming);
-	Assert(vacrel->do_index_cleanup);
-	Assert(vacrel->num_index_scans > 0);
+	Assert(vacrel->do_index_vacuuming || vacrel->use_conveyorbelt);
+	Assert(vacrel->do_index_cleanup || vacrel->use_conveyorbelt);
+	Assert(vacrel->num_index_scans > 0 || vacrel->use_conveyorbelt);
 
 	/* Report that we are now vacuuming the heap */
 	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
@@ -2455,7 +2604,7 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 	 * the second heap pass.  No more, no less.
 	 */
 	Assert(index > 0);
-	Assert(vacrel->num_index_scans > 1 ||
+	Assert(vacrel->use_conveyorbelt || vacrel->num_index_scans > 1 ||
 		   (index == vacrel->lpdead_items &&
 			vacuumed_pages == vacrel->lpdead_item_pages));
 
@@ -2465,6 +2614,97 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 
 	/* Revert to the previous phase information for error traceback */
 	restore_vacuum_error_info(vacrel, &saved_err_info);
+}
+
+/*
+ *	lazy_vacuum_heap() -- second pass over the heap for two pass strategy
+ */
+static void
+lazy_vacuum_heap(LVRelState *vacrel)
+{
+	CBPageNo	from_pageno;
+	CBPageNo	to_pageno = CB_INVALID_LOGICAL_PAGE;
+	CBPageNo	last_pageread;
+	VacDeadItems	   *dead_items = vacrel->dead_items;
+
+	/*
+	 * If  we are using the conveyor belt for the vacuuming then setup the
+	 * from_pageno and the to_pageno for reading dead items from the conveyor
+	 * belt.
+	 */
+	if (vacrel->use_conveyorbelt)
+	{
+		if (vacrel->rel->rd_rel->relvacuumpage == CB_INVALID_LOGICAL_PAGE)
+			from_pageno = VDI_GetOldestPage(vacrel->deaditemstate);
+		else
+			from_pageno = vacrel->rel->rd_rel->relvacuumpage + 1;
+
+		to_pageno = vacrel->vacrelpage;
+		for (int idx = 0; idx < vacrel->nindexes; idx++)
+		{
+			Relation	indrel = vacrel->indrels[idx];
+
+			if (vacrel->skipidxvacuum[idx])
+			{
+				if (indrel->rd_rel->relvacuumpage == CB_INVALID_LOGICAL_PAGE)
+					return;
+				else if (indrel->rd_rel->relvacuumpage < to_pageno)
+					to_pageno = indrel->rd_rel->relvacuumpage;
+			}
+		}
+
+		/* We have already done enough vacuum so nothing to be done. */
+		if (from_pageno >= to_pageno)
+			return;
+	}
+
+	/*
+	 * Loop until we complete the heap vacuum.  If we are not using the
+	 * conveyor belt then the loop will just run once for the dead items we
+	 * have in memory.  Otherwise, it will load the items from the conveyor
+	 * belt which fits in the cache and perform the heap pass and repeat until
+	 * we consume all the items in the conveyor belt between from_pageno and
+	 * to_pageno.
+	 */
+	while(1)
+	{
+		if (vacrel->use_conveyorbelt)
+		{
+			/* Read dead tids from the dead tuple store. */
+			dead_items->num_items = VDI_ReadDeadItems(vacrel->deaditemstate,
+													  from_pageno,
+													  to_pageno,
+													  dead_items->max_items,
+													  dead_items->items,
+													  &last_pageread);
+
+			/* No more dead tuples so we are done. */
+			if (dead_items->num_items == 0)
+				break;
+
+			/* Go to the next logical page. */
+			from_pageno = last_pageread + 1;
+		}
+
+		Assert(dead_items->num_items > 0);
+
+		/* Perform heap vacuum. */
+		lazy_vacuum_heap_rel(vacrel);
+
+		/*
+		 * If we are not doing heap vacuum using the conveyor belt then we are
+		 * done after one round.  Otherwise we will repeat this process until
+		 * we do the vacuuming for all the items in the coneveyor belt.
+		 */
+		if (!vacrel->use_conveyorbelt)
+			break;
+	}
+
+	if (vacrel->use_conveyorbelt)
+	{
+		vacrel->isheapvacuumdone = true;
+		vacrel->vacrelpage = to_pageno;
+	}
 }
 
 /*
@@ -2727,7 +2967,9 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 							 InvalidBlockNumber, InvalidOffsetNumber);
 
 	/* Do bulk deletion */
-	istat = vac_bulkdel_one_index(&ivinfo, istat, (void *) vacrel->dead_items);
+	istat = vac_bulkdel_one_index(&ivinfo, istat, (void *) vacrel->dead_items,
+								  vacrel->use_conveyorbelt ?
+								  vacrel->deaditemstate : NULL);
 
 	/* Revert to the previous phase information for error traceback */
 	restore_vacuum_error_info(vacrel, &saved_err_info);
@@ -3333,6 +3575,34 @@ heap_page_is_all_visible(LVRelState *vacrel, Buffer buf,
 	vacrel->offnum = InvalidOffsetNumber;
 
 	return all_visible;
+}
+
+/*
+ * update_relvacuum_page - update conveyor belt pageno in pg_class entry
+ *
+ * Update relation's pg_class entry with the conveyor belt pageno upto which
+ * we have completed the vacuum.
+ */
+void
+update_relvacuum_page(Oid relid, CBPageNo pageno)
+{
+	Relation		pgclass;
+	HeapTuple		reltup;
+
+	pgclass = table_open(RelationRelationId, RowExclusiveLock);
+
+	reltup = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(reltup))
+		elog(ERROR, "cache lookup failed for relation %u", relid);
+
+	/* Update pg_class tuple as appropriate. */
+	((Form_pg_class) GETSTRUCT(reltup))->relvacuumpage = pageno;
+
+	CatalogTupleUpdate(pgclass, &reltup->t_self, reltup);
+
+	/* Clean up */
+	heap_freetuple(reltup);
+	table_close(pgclass, RowExclusiveLock);
 }
 
 /*

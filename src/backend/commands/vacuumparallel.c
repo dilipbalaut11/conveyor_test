@@ -28,6 +28,7 @@
 
 #include "access/amapi.h"
 #include "access/table.h"
+#include "access/vacuumdeaditem.h"
 #include "catalog/index.h"
 #include "commands/vacuum.h"
 #include "optimizer/paths.h"
@@ -74,6 +75,7 @@ typedef struct PVShared
 	 */
 	double		reltuples;
 	bool		estimated_count;
+	bool		use_conveyorbelt;
 
 	/*
 	 * In single process vacuum we could consume more memory during index
@@ -145,6 +147,9 @@ struct ParallelVacuumState
 {
 	/* NULL for worker processes */
 	ParallelContext *pcxt;
+
+	/* Heap rel. */
+	Relation	rel;
 
 	/* Target indexes */
 	Relation   *indrels;
@@ -260,6 +265,7 @@ parallel_vacuum_init(Relation rel, Relation *indrels, int nindexes,
 	}
 
 	pvs = (ParallelVacuumState *) palloc0(sizeof(ParallelVacuumState));
+	pvs->rel = rel;
 	pvs->indrels = indrels;
 	pvs->nindexes = nindexes;
 	pvs->will_parallel_vacuum = will_parallel_vacuum;
@@ -450,7 +456,7 @@ parallel_vacuum_get_dead_items(ParallelVacuumState *pvs)
  */
 void
 parallel_vacuum_bulkdel_all_indexes(ParallelVacuumState *pvs, long num_table_tuples,
-									int num_index_scans)
+									int num_index_scans, bool use_conveyorbelt)
 {
 	Assert(!IsParallelWorker());
 
@@ -460,6 +466,7 @@ parallel_vacuum_bulkdel_all_indexes(ParallelVacuumState *pvs, long num_table_tup
 	 */
 	pvs->shared->reltuples = num_table_tuples;
 	pvs->shared->estimated_count = true;
+	pvs->shared->use_conveyorbelt = use_conveyorbelt;
 
 	parallel_vacuum_process_all_indexes(pvs, num_index_scans, true);
 }
@@ -819,6 +826,8 @@ parallel_vacuum_process_one_index(ParallelVacuumState *pvs, Relation indrel,
 {
 	IndexBulkDeleteResult *istat = NULL;
 	IndexBulkDeleteResult *istat_res;
+	VDI_DeadItemState	  *deaditemstate = NULL;
+	VacDeadItems		  *dead_items = NULL;
 	IndexVacuumInfo ivinfo;
 
 	/*
@@ -840,10 +849,27 @@ parallel_vacuum_process_one_index(ParallelVacuumState *pvs, Relation indrel,
 	pvs->indname = pstrdup(RelationGetRelationName(indrel));
 	pvs->status = indstats->status;
 
+	/*
+	 * Initialize the deaditem state if we are using the conveyor belt for the
+	 * dead items.
+	 */
+	if (pvs->shared->use_conveyorbelt)
+	{
+		deaditemstate = VDI_InitDeadItemState(pvs->rel);
+
+		dead_items =
+			(VacDeadItems *) palloc(vac_max_items_to_alloc_size(pvs->dead_items->max_items));
+		dead_items->max_items = pvs->dead_items->max_items;
+		dead_items->num_items = 0;
+	}
+	else
+		dead_items = pvs->dead_items;
+
 	switch (indstats->status)
 	{
 		case PARALLEL_INDVAC_STATUS_NEED_BULKDELETE:
-			istat_res = vac_bulkdel_one_index(&ivinfo, istat, pvs->dead_items);
+			istat_res = vac_bulkdel_one_index(&ivinfo, istat, dead_items,
+											  deaditemstate);
 			break;
 		case PARALLEL_INDVAC_STATUS_NEED_CLEANUP:
 			istat_res = vac_cleanup_one_index(&ivinfo, istat);
@@ -997,6 +1023,7 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 	VacuumActiveNWorkers = &(shared->active_nworkers);
 
 	/* Set parallel vacuum state */
+	pvs.rel = rel;
 	pvs.indrels = indrels;
 	pvs.nindexes = nindexes;
 	pvs.indstats = indstats;

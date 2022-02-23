@@ -2290,11 +2290,67 @@ get_vacoptval_from_boolean(DefElem *def)
  */
 IndexBulkDeleteResult *
 vac_bulkdel_one_index(IndexVacuumInfo *ivinfo, IndexBulkDeleteResult *istat,
-					  VacDeadItems *dead_items)
+					  VacDeadItems *dead_items,
+					  VDI_DeadItemState *deaditemstate)
 {
-	/* Do bulk deletion */
-	istat = index_bulk_delete(ivinfo, istat, vac_tid_reaped,
-							  (void *) dead_items);
+	CBPageNo	start_pageno;
+	CBPageNo	last_pageread;
+
+	/* Get the next cbpage from where we want to start vacuum. */
+	if (deaditemstate)
+	{
+		if (ivinfo->index->rd_rel->relvacuumpage == CB_INVALID_LOGICAL_PAGE)
+			start_pageno = VDI_GetOldestPage(deaditemstate);
+		else
+			start_pageno = ivinfo->index->rd_rel->relvacuumpage + 1;
+	}
+
+	/*
+	 * If we are performing the index vacuum directly from the dead items cache
+	 * the the loop will only run once.  Otherwise, we will load the dead items
+	 * multiple times from the conveyor belt into the dead_items cache and
+	 * perform the index vacuum.
+	 *
+	 * Note: Another option could be that we read one set of dead items from
+	 * the conveyor belt and then perform vacuum for all the indexes and then
+	 * do the heap second pass then then reload the next set of dead items from
+	 * the conveyor belt.  But basically, each index might have different
+	 * vacuuming need and the current vacuum state of every index could be
+	 * different so it make more sense to do them individually.
+	 */
+	while(1)
+	{
+		if (deaditemstate)
+		{
+			/* Read dead tids from the dead tuple store. */
+			dead_items->num_items = VDI_ReadDeadItems(deaditemstate,
+													  start_pageno,
+													  CB_INVALID_LOGICAL_PAGE,
+													  dead_items->max_items,
+													  dead_items->items,
+													  &last_pageread);
+
+			/* No more dead tuples so we are done. */
+			if (dead_items->num_items == 0)
+				break;
+
+			/* Go to the next page. */
+			start_pageno = last_pageread + 1;
+		}
+		Assert(dead_items->num_items > 0);
+
+		/* Do bulk deletion */
+		istat = index_bulk_delete(ivinfo, istat, vac_tid_reaped,
+								  (void *) dead_items);
+
+		/*
+		 * If we are not doing bulk delete using the conveyor belt then we are
+		 * done after one round.  Otherwise we will repeat this process until
+		 * we do the index vacuuming for all the items in the coneveyor belt.
+		 */
+		if (!deaditemstate)
+			break;
+	}
 
 	ereport(ivinfo->message_level,
 			(errmsg("scanned index \"%s\" to remove %d row versions",
