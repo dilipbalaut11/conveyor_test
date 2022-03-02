@@ -123,6 +123,7 @@ bthandler(PG_FUNCTION_ARGS)
 	amroutine->ambuildempty = btbuildempty;
 	amroutine->aminsert = btinsert;
 	amroutine->ambulkdelete = btbulkdelete;
+	amroutine->amskipbulkdelete = btskipbulkdelete;
 	amroutine->amvacuumcleanup = btvacuumcleanup;
 	amroutine->amcanreturn = btcanreturn;
 	amroutine->amcostestimate = btcostestimate;
@@ -805,6 +806,17 @@ btbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	_bt_end_vacuum(rel);
 
 	return stats;
+}
+
+/*
+ * Check based on the current bloat size whether we can skip bulk deletion or
+ * not.
+ */
+bool
+btskipbulkdelete(Relation indexRelation)
+{
+	/* TODO: implement the skipping logic for the btree. */
+	return false;
 }
 
 /*

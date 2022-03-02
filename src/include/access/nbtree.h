@@ -1138,6 +1138,7 @@ extern IndexBulkDeleteResult *btbulkdelete(IndexVacuumInfo *info,
 										   IndexBulkDeleteResult *stats,
 										   IndexBulkDeleteCallback callback,
 										   void *callback_state);
+extern bool btskipbulkdelete(Relation indexRelation);
 extern IndexBulkDeleteResult *btvacuumcleanup(IndexVacuumInfo *info,
 											  IndexBulkDeleteResult *stats);
 extern bool btcanreturn(Relation index, int attno);

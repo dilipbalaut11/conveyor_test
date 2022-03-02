@@ -118,6 +118,7 @@ typedef IndexBulkDeleteResult *(*ambulkdelete_function) (IndexVacuumInfo *info,
 														 IndexBulkDeleteResult *stats,
 														 IndexBulkDeleteCallback callback,
 														 void *callback_state);
+typedef bool (*amskipbulkdelete_function) (Relation indexRelation);
 
 /* post-VACUUM cleanup */
 typedef IndexBulkDeleteResult *(*amvacuumcleanup_function) (IndexVacuumInfo *info,
@@ -262,6 +263,7 @@ typedef struct IndexAmRoutine
 	ambuildempty_function ambuildempty;
 	aminsert_function aminsert;
 	ambulkdelete_function ambulkdelete;
+	amskipbulkdelete_function amskipbulkdelete;	/* can be NULL */
 	amvacuumcleanup_function amvacuumcleanup;
 	amcanreturn_function amcanreturn;	/* can be NULL */
 	amcostestimate_function amcostestimate;

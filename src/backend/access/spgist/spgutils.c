@@ -71,6 +71,7 @@ spghandler(PG_FUNCTION_ARGS)
 	amroutine->ambuildempty = spgbuildempty;
 	amroutine->aminsert = spginsert;
 	amroutine->ambulkdelete = spgbulkdelete;
+	amroutine->amskipbulkdelete = NULL;
 	amroutine->amvacuumcleanup = spgvacuumcleanup;
 	amroutine->amcanreturn = spgcanreturn;
 	amroutine->amcostestimate = spgcostestimate;

@@ -180,6 +180,7 @@ extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 												IndexBulkDeleteResult *istat,
 												IndexBulkDeleteCallback callback,
 												void *callback_state);
+extern bool index_skip_bulk_delete(Relation indexRelation);
 extern IndexBulkDeleteResult *index_vacuum_cleanup(IndexVacuumInfo *info,
 												   IndexBulkDeleteResult *istat);
 extern bool index_can_return(Relation indexRelation, int attno);
