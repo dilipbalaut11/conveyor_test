@@ -703,6 +703,23 @@ index_bulk_delete(IndexVacuumInfo *info,
 }
 
 /* ----------------
+ *		index_skip_bulk_delete - do index need bulk deletion
+ *
+ *		return true if index need bulk deletion, false otherwise.
+ * ----------------
+ */
+bool
+index_skip_bulk_delete(Relation indexRelation)
+{
+	RELATION_CHECKS;
+
+	if (indexRelation->rd_indam->amskipbulkdelete == NULL)
+		return false;
+
+	return indexRelation->rd_indam->amskipbulkdelete(indexRelation);
+}
+
+/* ----------------
  *		index_vacuum_cleanup - do post-deletion cleanup of an index
  *
  *		return value is an optional palloc'd struct of statistics

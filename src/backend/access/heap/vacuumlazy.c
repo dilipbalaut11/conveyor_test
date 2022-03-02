@@ -2297,6 +2297,7 @@ static bool
 lazy_vacuum_all_indexes(LVRelState *vacrel)
 {
 	bool		allindexes = true;
+	static int x=0;
 
 	Assert(vacrel->nindexes > 0);
 	Assert(vacrel->do_index_vacuuming);
@@ -2309,6 +2310,13 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 		return false;
 	}
 
+	x++;
+	if (x == 4)
+	{
+		x = 0;
+		return false;
+	}
+	
 	/* Report that we are now vacuuming indexes */
 	pgstat_progress_update_param(PROGRESS_VACUUM_PHASE,
 								 PROGRESS_VACUUM_PHASE_VACUUM_INDEX);
@@ -2319,6 +2327,12 @@ lazy_vacuum_all_indexes(LVRelState *vacrel)
 		{
 			Relation	indrel = vacrel->indrels[idx];
 			IndexBulkDeleteResult *istat = vacrel->indstats[idx];
+
+			if (index_skip_bulk_delete(indrel))
+			{
+				allindexes = false;
+				continue;
+			}
 
 			vacrel->indstats[idx] =
 				lazy_vacuum_one_index(indrel, istat, vacrel->old_live_tuples,
